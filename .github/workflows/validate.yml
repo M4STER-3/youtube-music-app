@@ -1,0 +1,68 @@
+name: Validate engine
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  validate:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Check standalone JavaScript syntax
+        run: |
+          node --check youtube-api.js
+          node --check android-bridge.js
+          node --check tests/youtube-api.test.cjs
+
+      - name: Extract inline JavaScript from HTML
+        run: |
+          python3 - <<'PY'
+          from html.parser import HTMLParser
+          from pathlib import Path
+
+          class ScriptParser(HTMLParser):
+              def __init__(self):
+                  super().__init__()
+                  self.inline = False
+                  self.buffer = []
+                  self.scripts = []
+
+              def handle_starttag(self, tag, attrs):
+                  if tag.lower() != "script":
+                      return
+                  attrs = dict(attrs)
+                  self.inline = "src" not in attrs
+                  self.buffer = []
+
+              def handle_data(self, data):
+                  if self.inline:
+                      self.buffer.append(data)
+
+              def handle_endtag(self, tag):
+                  if tag.lower() == "script" and self.inline:
+                      self.scripts.append("".join(self.buffer))
+                      self.inline = False
+                      self.buffer = []
+
+          output = Path(".ci-inline")
+          output.mkdir(exist_ok=True)
+          for html_name in ["player.html", "test.html", "offline-tests.html"]:
+              parser = ScriptParser()
+              parser.feed(Path(html_name).read_text(encoding="utf-8"))
+              for index, source in enumerate(parser.scripts, start=1):
+                  (output / f"{Path(html_name).stem}-{index}.js").write_text(source, encoding="utf-8")
+          PY
+
+      - name: Check inline JavaScript syntax
+        run: |
+          for file in .ci-inline/*.js; do
+            echo "Checking $file"
+            node --check "$file"
+          done
+
+      - name: Run YouTube Data regression tests
+        run: node tests/youtube-api.test.cjs
