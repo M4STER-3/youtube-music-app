@@ -18,16 +18,17 @@ import java.util.concurrent.atomic.AtomicLong;
  * Reference bridge for player.html <-> Android.
  *
  * Uses only Android framework APIs (WebMessagePort, API 23+) and org.json.
- * Call installAfterPageFinished() after the trusted local player page has finished loading.
- * Pass an explicit target origin. Use WILDCARD_ORIGIN only when unavoidable, and then
- * prevent this WebView from navigating to untrusted top-level pages.
+ * Call installAfterPageFinished() only after the trusted player document has loaded.
+ * The targetOrigin must be the exact HTTPS origin used by loadDataWithBaseURL().
+ *
+ * android-bridge.js and youtube-api.js are loaded from APK assets and injected into
+ * the trusted main frame. No JavaScript interface is exposed to the YouTube iframe.
  */
 public final class YouTubeWebMessageBridge implements AutoCloseable {
     public static final String HANDSHAKE = "youtube-player-bridge";
-    public static final Uri WILDCARD_ORIGIN = Uri.parse("*");
 
     public interface Listener {
-        /** Receives bridgeReady, playerEvent and response JSON messages. */
+        /** Receives bridgeReady, playerEvent, bridgeEvent, response and nativeError JSON. */
         void onBridgeMessage(String json);
     }
 
@@ -46,31 +47,42 @@ public final class YouTubeWebMessageBridge implements AutoCloseable {
             Listener listener
     ) {
         if (webView == null) throw new IllegalArgumentException("webView == null");
+        if (targetOrigin == null) throw new IllegalArgumentException("targetOrigin == null");
+        if (!"https".equalsIgnoreCase(targetOrigin.getScheme())) {
+            throw new IllegalArgumentException("targetOrigin must use https");
+        }
+        if (targetOrigin.getHost() == null || targetOrigin.getHost().isEmpty()) {
+            throw new IllegalArgumentException("targetOrigin must have a host");
+        }
+
         this.webView = webView;
         this.appContext = webView.getContext().getApplicationContext();
-        if (targetOrigin == null) throw new IllegalArgumentException("targetOrigin == null");
         this.targetOrigin = targetOrigin;
         this.listener = listener;
     }
 
     /**
-     * Installs android-bridge.js and creates the WebMessage channel.
-     * Invoke from WebViewClient.onPageFinished() for player.html.
+     * Installs youtube-api.js then android-bridge.js and creates the WebMessage channel.
+     * Invoke from WebViewClient.onPageFinished() for the trusted app origin only.
      */
     public void installAfterPageFinished() {
         webView.post(() -> {
             closePortOnly();
             installed = false;
 
+            final String dataApiScript;
             final String bridgeScript;
             try {
+                dataApiScript = readAsset("youtube-api.js");
                 bridgeScript = readAsset("android-bridge.js");
             } catch (IOException error) {
                 notifyListener(errorJson("bridgeAssetError", error.getMessage()));
                 return;
             }
 
-            webView.evaluateJavascript(bridgeScript, ignored -> createMessageChannel());
+            // Both assets are code shipped inside the APK. They run only in the trusted main page.
+            String installationScript = dataApiScript + "\n;\n" + bridgeScript;
+            webView.evaluateJavascript(installationScript, ignored -> createMessageChannel());
         });
     }
 
@@ -90,7 +102,7 @@ public final class YouTubeWebMessageBridge implements AutoCloseable {
             }
         });
 
-        // ports[1] is transferred to JavaScript and must not be reused by Java afterwards.
+        // ports[1] is transferred to JavaScript and must never be reused by Java afterwards.
         WebMessage handshake = new WebMessage(HANDSHAKE, new WebMessagePort[]{ports[1]});
         webView.postWebMessage(handshake, targetOrigin);
         installed = true;
@@ -99,6 +111,14 @@ public final class YouTubeWebMessageBridge implements AutoCloseable {
     public boolean isInstalled() {
         return installed && androidPort != null;
     }
+
+    public Uri getTargetOrigin() {
+        return targetOrigin;
+    }
+
+    // -------------------------------------------------------------------------
+    // Player commands
+    // -------------------------------------------------------------------------
 
     public long sendCommand(String command) {
         return sendCommand(command, null);
@@ -120,6 +140,10 @@ public final class YouTubeWebMessageBridge implements AutoCloseable {
 
     public long getProgress() {
         return postRequest(baseRequest("getProgress"));
+    }
+
+    public long isPlayerReady() {
+        return postRequest(baseRequest("isReady"));
     }
 
     public long loadVideo(String videoId, boolean autoplay, double startSeconds) {
@@ -171,6 +195,64 @@ public final class YouTubeWebMessageBridge implements AutoCloseable {
         }
         return sendCommand("seekTo", value);
     }
+
+    // -------------------------------------------------------------------------
+    // YouTube Data API commands
+    // -------------------------------------------------------------------------
+
+    /**
+     * Stores the YouTube Data API key only in the WebView JavaScript memory.
+     * The bridge never persists or echoes the key back to Android.
+     */
+    public long setYouTubeApiKey(String apiKey) {
+        JSONObject request = baseRequest("setYouTubeApiKey");
+        try {
+            request.put("apiKey", apiKey == null ? "" : apiKey);
+        } catch (JSONException ignored) {
+        }
+        return postRequest(request);
+    }
+
+    public long clearYouTubeApiKey() {
+        return postRequest(baseRequest("clearYouTubeApiKey"));
+    }
+
+    public long hasYouTubeApiKey() {
+        return postRequest(baseRequest("hasYouTubeApiKey"));
+    }
+
+    /**
+     * Imports a complete playlist. Progress arrives as bridgeEvent/youtubeDataProgress.
+     * The final response contains a compact playlist structure suitable for local storage.
+     */
+    public long getPlaylist(String playlistUrlOrId) {
+        JSONObject request = baseRequest("getPlaylist");
+        try {
+            request.put("playlist", playlistUrlOrId == null ? "" : playlistUrlOrId);
+            request.put("includeVideoDetails", true);
+        } catch (JSONException ignored) {
+        }
+        return postRequest(request);
+    }
+
+    /**
+     * Refreshes a playlist and computes a diff against the previously stored JSON object.
+     * previousPlaylist may be null for a normal import.
+     */
+    public long syncPlaylist(String playlistUrlOrId, JSONObject previousPlaylist) {
+        JSONObject request = baseRequest("syncPlaylist");
+        try {
+            request.put("playlist", playlistUrlOrId == null ? "" : playlistUrlOrId);
+            request.put("includeVideoDetails", true);
+            if (previousPlaylist != null) request.put("previousPlaylist", previousPlaylist);
+        } catch (JSONException ignored) {
+        }
+        return postRequest(request);
+    }
+
+    // -------------------------------------------------------------------------
+    // Request transport
+    // -------------------------------------------------------------------------
 
     private JSONObject baseRequest(String action) {
         JSONObject request = new JSONObject();
