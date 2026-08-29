@@ -1,0 +1,276 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Offline tests — YouTube Music Engine</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background:#0f0f0f; color:#f5f5f5; }
+    body { margin:0; padding:24px; max-width:900px; margin-inline:auto; }
+    button { font:inherit; padding:10px 14px; border:0; border-radius:10px; cursor:pointer; }
+    .card { background:#181818; border:1px solid #2a2a2a; border-radius:14px; padding:16px; margin:14px 0; }
+    .test { padding:9px 11px; border-radius:9px; background:#111; margin:7px 0; }
+    .ok { color:#9ce7b2; }
+    .fail { color:#ff9d9d; }
+    pre { white-space:pre-wrap; overflow-wrap:anywhere; background:#101010; border-radius:10px; padding:12px; }
+  </style>
+</head>
+<body>
+  <h1>Tests hors ligne du moteur Data API</h1>
+  <p>Cette page remplace temporairement <code>fetch()</code> par une API YouTube simulée. Elle ne contacte pas Google et ne consomme aucun quota.</p>
+  <button id="run">Lancer les tests</button>
+  <div id="results" class="card"></div>
+  <pre id="details"></pre>
+
+  <script src="youtube-api.js"></script>
+  <script>
+    "use strict";
+
+    const TOTAL_ITEMS = 420;
+    const PLAYLIST_ID = "PL1234567890ABCDE";
+    const UNAVAILABLE_ID = makeVideoId(300);
+    const DUPLICATE_POSITION = 17;
+    const originalFetch = window.fetch;
+
+    function makeVideoId(index) {
+      return `V${String(index).padStart(10, "0")}`;
+    }
+
+    function makePlaylistItem(position) {
+      const videoId = position === DUPLICATE_POSITION ? makeVideoId(DUPLICATE_POSITION - 1) : makeVideoId(position);
+      return {
+        id: `PLI${String(position).padStart(6, "0")}`,
+        snippet: {
+          position,
+          title: `Titre ${position}`,
+          description: "",
+          publishedAt: "2026-01-01T00:00:00Z",
+          videoOwnerChannelId: "CHANNEL123",
+          videoOwnerChannelTitle: "Chaîne test",
+          resourceId: { videoId },
+          thumbnails: { medium: { url: `https://img.example/${videoId}.jpg`, width: 320, height: 180 } },
+        },
+        contentDetails: { videoId },
+        status: { privacyStatus: "public" },
+      };
+    }
+
+    function response(status, body, headers = {}) {
+      return {
+        ok: status >= 200 && status < 300,
+        status,
+        headers: { get(name) { return headers[String(name).toLowerCase()] || headers[name] || null; } },
+        async json() { return body; },
+      };
+    }
+
+    function createMockFetch() {
+      let failedFirstPlaylistItems = false;
+      let totalCalls = 0;
+      let videosCallsWithMaxResults = 0;
+      const calls = [];
+
+      async function mockFetch(input) {
+        totalCalls += 1;
+        const url = new URL(String(input));
+        calls.push(url.toString().replace(/([?&]key=)[^&]+/, "$1REDACTED"));
+        const resource = url.pathname.split("/").pop();
+
+        if (resource === "playlists") {
+          return response(200, {
+            items: [{
+              snippet: {
+                title: "Playlist simulée",
+                description: "",
+                channelId: "CHANNEL123",
+                channelTitle: "Chaîne test",
+                publishedAt: "2026-01-01T00:00:00Z",
+                thumbnails: { high: { url: "https://img.example/playlist.jpg", width: 480, height: 360 } },
+              },
+              contentDetails: { itemCount: TOTAL_ITEMS },
+              status: { privacyStatus: "public" },
+            }],
+          });
+        }
+
+        if (resource === "playlistItems") {
+          if (!failedFirstPlaylistItems) {
+            failedFirstPlaylistItems = true;
+            return response(500, {
+              error: {
+                message: "Backend temporairement indisponible",
+                errors: [{ reason: "backendError", message: "Backend temporairement indisponible" }],
+              },
+            });
+          }
+
+          const token = url.searchParams.get("pageToken") || "p0";
+          const page = Number(token.slice(1)) || 0;
+          const start = page * 50;
+          const end = Math.min(TOTAL_ITEMS, start + 50);
+          const items = [];
+          for (let index = start; index < end; index += 1) items.push(makePlaylistItem(index));
+          return response(200, {
+            nextPageToken: end < TOTAL_ITEMS ? `p${page + 1}` : undefined,
+            pageInfo: { totalResults: TOTAL_ITEMS, resultsPerPage: items.length },
+            items,
+          });
+        }
+
+        if (resource === "videos") {
+          if (url.searchParams.has("maxResults")) videosCallsWithMaxResults += 1;
+          const ids = String(url.searchParams.get("id") || "").split(",").filter(Boolean);
+          return response(200, {
+            items: ids.filter((id) => id !== UNAVAILABLE_ID).map((id) => ({
+              id,
+              snippet: {
+                title: `Détail ${id}`,
+                description: "",
+                channelId: "CHANNEL123",
+                channelTitle: "Chaîne test",
+                publishedAt: "2026-01-01T00:00:00Z",
+                liveBroadcastContent: "none",
+                thumbnails: { high: { url: `https://img.example/${id}.jpg`, width: 480, height: 360 } },
+              },
+              contentDetails: {
+                duration: "PT3M5S",
+                definition: "hd",
+                caption: "false",
+                licensedContent: true,
+              },
+              status: {
+                privacyStatus: "public",
+                uploadStatus: "processed",
+                embeddable: true,
+              },
+            })),
+          });
+        }
+
+        return response(404, { error: { message: "Unknown mock resource" } });
+      }
+
+      mockFetch.inspect = () => ({ totalCalls, videosCallsWithMaxResults, calls });
+      return mockFetch;
+    }
+
+    function createQuotaFetch() {
+      let calls = 0;
+      const fn = async () => {
+        calls += 1;
+        return response(403, {
+          error: {
+            message: "Quota dépassé",
+            errors: [{ reason: "quotaExceeded", message: "Quota dépassé" }],
+          },
+        });
+      };
+      fn.calls = () => calls;
+      return fn;
+    }
+
+    function addResult(name, passed, extra = "") {
+      const row = document.createElement("div");
+      row.className = `test ${passed ? "ok" : "fail"}`;
+      row.textContent = `${passed ? "✅" : "❌"} ${name}${extra ? ` — ${extra}` : ""}`;
+      document.getElementById("results").appendChild(row);
+      return passed;
+    }
+
+    async function run() {
+      const root = document.getElementById("results");
+      const details = document.getElementById("details");
+      root.textContent = "";
+      details.textContent = "";
+      let passed = 0;
+      let total = 0;
+      const check = (name, condition, extra = "") => {
+        total += 1;
+        if (addResult(name, !!condition, extra)) passed += 1;
+      };
+
+      try {
+        const progressEvents = [];
+        const mockFetch = createMockFetch();
+        window.fetch = mockFetch;
+        YouTubeData.setApiKey("TEST_KEY_NOT_REAL");
+
+        const result = await YouTubeData.getPlaylist(PLAYLIST_ID, {
+          includeVideoDetails: true,
+          maxRetries: 2,
+          retryBaseDelayMs: 100,
+          retryMaxDelayMs: 500,
+          onProgress(event) { progressEvents.push(event); },
+        });
+
+        const inspect = mockFetch.inspect();
+        check("420 entrées importées", result.items.length === TOTAL_ITEMS, `${result.items.length}`);
+        check("Pagination complète", progressEvents.filter((e) => e.stage === "playlistItems").length === 9);
+        check("Doublon conservé", result.items[DUPLICATE_POSITION].videoId === result.items[DUPLICATE_POSITION - 1].videoId);
+        check("Vidéo indisponible détectée", result.stats.unavailable === 1, `${result.stats.unavailable}`);
+        check("419 entrées lisibles", result.stats.playable === 419, `${result.stats.playable}`);
+        check("Durée convertie", result.items[0].durationSeconds === 185 && result.items[0].durationText === "3:05");
+        check("Retry automatique effectué", result.retriesUsed === 1, `${result.retriesUsed}`);
+        check("Nombre réel de requêtes", result.requestsUsed === 20, `${result.requestsUsed}`);
+        check("Événement retry publié", progressEvents.some((e) => e.stage === "retry" && e.retry === 1));
+        check("videos.list sans maxResults avec id", inspect.videosCallsWithMaxResults === 0, `${inspect.videosCallsWithMaxResults}`);
+        check("Date de refresh recommandée présente", Number.isFinite(Date.parse(result.refreshRecommendedAt)));
+        check("Date limite 30 jours présente", Number.isFinite(Date.parse(result.mustRefreshBy)));
+
+        const synced = Date.parse(result.syncedAt);
+        check("Pas de refresh exigé à J+24", !YouTubeData.isRefreshDue(result.syncedAt, synced + 24 * 86400000));
+        check("Refresh recommandé à J+26", YouTubeData.isRefreshDue(result.syncedAt, synced + 26 * 86400000));
+        check("Données expirées à J+30", YouTubeData.isExpired(result.syncedAt, synced + 30 * 86400000));
+
+        const diff = YouTubeData.buildDiff(
+          { items: [
+            { playlistItemId: "A", position: 0, title: "A", channelTitle: "C", durationSeconds: 10, available: true, embeddable: true },
+            { playlistItemId: "B", position: 1, title: "B", channelTitle: "C", durationSeconds: 10, available: true, embeddable: true },
+          ] },
+          { items: [
+            { playlistItemId: "B", position: 0, title: "B modifié", channelTitle: "C", durationSeconds: 10, available: true, embeddable: true },
+            { playlistItemId: "C", position: 1, title: "C", channelTitle: "C", durationSeconds: 10, available: true, embeddable: true },
+          ] }
+        );
+        check("Diff ajout", diff.counts.added === 1);
+        check("Diff suppression", diff.counts.removed === 1);
+        check("Diff déplacement", diff.counts.moved === 1);
+        check("Diff métadonnée", diff.counts.changed === 1);
+
+        const quotaFetch = createQuotaFetch();
+        window.fetch = quotaFetch;
+        let quotaError = null;
+        try {
+          await YouTubeData.getPlaylist(PLAYLIST_ID, { maxRetries: 2, retryBaseDelayMs: 100, retryMaxDelayMs: 500 });
+        } catch (error) {
+          quotaError = error;
+        }
+        check("quotaExceeded non retryable", quotaError?.reason === "quotaExceeded" && quotaError?.retryable === false);
+        check("Aucun retry sur quotaExceeded", quotaFetch.calls() === 1, `${quotaFetch.calls()}`);
+
+        details.textContent = JSON.stringify({
+          passed,
+          total,
+          importedItems: result.items.length,
+          playable: result.stats.playable,
+          unavailable: result.stats.unavailable,
+          requestsUsed: result.requestsUsed,
+          retriesUsed: result.retriesUsed,
+          refreshRecommendedAt: result.refreshRecommendedAt,
+          mustRefreshBy: result.mustRefreshBy,
+          mockCalls: inspect.totalCalls,
+        }, null, 2);
+      } catch (error) {
+        addResult("Le scénario de test s’est terminé sans exception", false, error?.message || String(error));
+        details.textContent = error?.stack || String(error);
+      } finally {
+        window.fetch = originalFetch;
+        YouTubeData.clearApiKey();
+      }
+    }
+
+    document.getElementById("run").addEventListener("click", run);
+    run();
+  </script>
+</body>
+</html>
