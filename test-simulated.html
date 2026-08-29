@@ -1,0 +1,192 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Tests simulés YouTubeData</title>
+  <style>
+    :root { color-scheme: dark; font-family: system-ui, sans-serif; background:#101010; color:#f5f5f5; }
+    body { margin:0; padding:24px; max-width:900px; margin-inline:auto; }
+    button { padding:10px 14px; border:0; border-radius:10px; cursor:pointer; }
+    .test { margin:8px 0; padding:10px 12px; border-radius:10px; background:#1c1c1c; }
+    .ok { color:#9ce7b2; } .bad { color:#ff9d9d; }
+    pre { white-space:pre-wrap; background:#181818; padding:12px; border-radius:10px; }
+  </style>
+</head>
+<body>
+  <h1>Tests simulés — aucune requête YouTube réelle</h1>
+  <p>Simule une playlist de 420 entrées, plusieurs pages, un doublon, une vidéo indisponible et une erreur temporaire 503 afin de tester le retry.</p>
+  <button id="run">Lancer les tests</button>
+  <div id="results"></div>
+  <pre id="details"></pre>
+
+  <script src="youtube-api.js"></script>
+  <script>
+    "use strict";
+
+    const PLAYLIST_ID = "PL_SIMULATED_420";
+    const TOTAL = 420;
+    const unavailableId = videoIdFor(150);
+    let firstVideosFailure = true;
+    let videosRequestHadUnsupportedMaxResults = false;
+    let mockCalls = [];
+
+    function videoIdFor(index) {
+      return `V${String(index).padStart(10, "0")}`;
+    }
+
+    function response(status, body, headers = {}) {
+      return {
+        ok: status >= 200 && status < 300,
+        status,
+        headers: { get(name) { return headers[String(name).toLowerCase()] || null; } },
+        async json() { return body; },
+      };
+    }
+
+    function playlistEntry(position) {
+      let videoId = videoIdFor(position);
+      if (position === 77) videoId = videoIdFor(5); // doublon volontaire
+      return {
+        id: `PLI_${String(position).padStart(6, "0")}`,
+        snippet: {
+          position,
+          title: `Titre ${position}`,
+          publishedAt: "2026-01-01T00:00:00Z",
+          resourceId: { videoId },
+          videoOwnerChannelId: "CHANNEL_1",
+          videoOwnerChannelTitle: "Chaîne simulée",
+          thumbnails: { medium: { url: `https://img.local/${videoId}.jpg`, width: 320, height: 180 } },
+        },
+        contentDetails: { videoId },
+        status: { privacyStatus: "public" },
+      };
+    }
+
+    const allEntries = Array.from({ length: TOTAL }, (_, index) => playlistEntry(index));
+
+    async function mockFetch(rawUrl) {
+      const url = new URL(rawUrl);
+      const resource = url.pathname.split("/").pop();
+      mockCalls.push(url.toString());
+
+      if (resource === "playlists") {
+        return response(200, { items: [{
+          id: PLAYLIST_ID,
+          snippet: {
+            title: "Playlist simulée 420",
+            channelId: "CHANNEL_1",
+            channelTitle: "Chaîne simulée",
+            publishedAt: "2026-01-01T00:00:00Z",
+            thumbnails: { high: { url: "https://img.local/playlist.jpg", width: 480, height: 360 } },
+          },
+          contentDetails: { itemCount: TOTAL },
+          status: { privacyStatus: "public" },
+        }] });
+      }
+
+      if (resource === "playlistItems") {
+        const start = Number(url.searchParams.get("pageToken") || 0);
+        const size = Number(url.searchParams.get("maxResults") || 50);
+        const items = allEntries.slice(start, start + size);
+        const next = start + size < TOTAL ? String(start + size) : undefined;
+        return response(200, {
+          items,
+          nextPageToken: next,
+          pageInfo: { totalResults: TOTAL, resultsPerPage: items.length },
+        });
+      }
+
+      if (resource === "videos") {
+        if (url.searchParams.has("maxResults")) videosRequestHadUnsupportedMaxResults = true;
+        if (firstVideosFailure) {
+          firstVideosFailure = false;
+          return response(503, {
+            error: { message: "Temporary backend error", errors: [{ reason: "backendError" }] },
+          }, { "retry-after": "0" });
+        }
+        const ids = String(url.searchParams.get("id") || "").split(",").filter(Boolean);
+        const items = ids.filter((id) => id !== unavailableId).map((id) => ({
+          id,
+          snippet: {
+            title: `Détail ${id}`,
+            channelId: "CHANNEL_1",
+            channelTitle: "Chaîne simulée",
+            publishedAt: "2025-01-01T00:00:00Z",
+            liveBroadcastContent: "none",
+            thumbnails: { high: { url: `https://img.local/${id}-high.jpg`, width: 480, height: 360 } },
+          },
+          contentDetails: { duration: "PT3M5S", definition: "hd", caption: "false", licensedContent: true },
+          status: { privacyStatus: "public", uploadStatus: "processed", embeddable: true },
+        }));
+        return response(200, { items });
+      }
+
+      return response(404, { error: { message: "Unknown mock resource" } });
+    }
+
+    function addResult(name, passed, detail = "") {
+      const div = document.createElement("div");
+      div.className = `test ${passed ? "ok" : "bad"}`;
+      div.textContent = `${passed ? "✅" : "❌"} ${name}${detail ? ` — ${detail}` : ""}`;
+      document.getElementById("results").appendChild(div);
+    }
+
+    async function run() {
+      const results = document.getElementById("results");
+      const details = document.getElementById("details");
+      results.textContent = "";
+      details.textContent = "Exécution…";
+      firstVideosFailure = true;
+      videosRequestHadUnsupportedMaxResults = false;
+      mockCalls = [];
+
+      const realFetch = window.fetch;
+      window.fetch = mockFetch;
+      try {
+        const progress = [];
+        const playlist = await YouTubeData.getPlaylist(PLAYLIST_ID, {
+          apiKey: "SIMULATED_KEY",
+          maxRetries: 2,
+          retryBaseDelayMs: 100,
+          retryMaxDelayMs: 200,
+          onProgress(info) { progress.push(info); },
+        });
+
+        addResult("420 entrées récupérées", playlist.items.length === TOTAL, `${playlist.items.length}`);
+        addResult("Doublon conservé", playlist.items[77].videoId === playlist.items[5].videoId);
+        addResult("Vidéo indisponible conservée dans l’ordre", playlist.items[150].available === false && playlist.items[150].playable === false);
+        addResult("Durée convertie", playlist.items[0].durationSeconds === 185 && playlist.items[0].durationText === "3:05");
+        addResult("Retry 503 effectué", playlist.retriesUsed === 1 && progress.some((item) => item.stage === "retry"), `${playlist.retriesUsed} retry`);
+        addResult("videos.list sans maxResults + id", !videosRequestHadUnsupportedMaxResults);
+        addResult("Dates de rafraîchissement présentes", !!playlist.refreshRecommendedAt && !!playlist.mustRefreshBy);
+        addResult("Toutes les pages playlistItems parcourues", mockCalls.filter((url) => url.includes("/playlistItems?")).length === 9);
+
+        const previous = JSON.parse(JSON.stringify(playlist));
+        previous.items = previous.items.filter((item) => item.position !== 10);
+        const synced = await YouTubeData.syncPlaylist(PLAYLIST_ID, previous, {
+          apiKey: "SIMULATED_KEY",
+          maxRetries: 0,
+        });
+        addResult("Diff Update détecte une entrée ajoutée", synced.diff.counts.added >= 1, `+${synced.diff.counts.added}`);
+
+        details.textContent = JSON.stringify({
+          requestsUsed: playlist.requestsUsed,
+          retriesUsed: playlist.retriesUsed,
+          stats: playlist.stats,
+          refreshRecommendedAt: playlist.refreshRecommendedAt,
+          mustRefreshBy: playlist.mustRefreshBy,
+          diff: synced.diff.counts,
+        }, null, 2);
+      } catch (error) {
+        addResult("Exécution générale", false, error?.message || String(error));
+        details.textContent = error?.stack || String(error);
+      } finally {
+        window.fetch = realFetch;
+      }
+    }
+
+    document.getElementById("run").addEventListener("click", run);
+  </script>
+</body>
+</html>
