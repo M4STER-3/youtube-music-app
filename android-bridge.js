@@ -1,7 +1,7 @@
 (function (global) {
   "use strict";
 
-  const BRIDGE_VERSION = "1.2.0";
+  const BRIDGE_VERSION = "1.3.0";
   const HANDSHAKE = "youtube-player-bridge";
   const EVENT_NAME = "youtube-player-event";
   const NATIVE_NONCE = String(global.__ANDROID_BRIDGE_NONCE || "");
@@ -61,6 +61,7 @@
       message: String(error?.message || error || "Erreur JavaScript"),
       status: Number(error?.status) || 0,
       retryable: !!error?.retryable,
+      retryAfterMs: Math.max(0, Number(error?.retryAfterMs) || 0),
     };
   }
 
@@ -102,8 +103,11 @@
       reportedItemCount: Math.max(0, Number(result.reportedItemCount) || 0),
       privacyStatus: String(result.privacyStatus || ""),
       syncedAt: String(result.syncedAt || ""),
+      refreshRecommendedAt: String(result.refreshRecommendedAt || ""),
+      mustRefreshBy: String(result.mustRefreshBy || ""),
       elapsedMs: Math.max(0, Number(result.elapsedMs) || 0),
       requestsUsed: Math.max(0, Number(result.requestsUsed) || 0),
+      retriesUsed: Math.max(0, Number(result.retriesUsed) || 0),
       stats: result.stats || null,
       videoIds: Array.isArray(result.videoIds) ? result.videoIds : [],
       playableVideoIds: Array.isArray(result.playableVideoIds) ? result.playableVideoIds : [],
@@ -166,6 +170,9 @@
           const playlist = String(request?.playlist || request?.playlistId || "");
           const options = {
             includeVideoDetails: request?.includeVideoDetails !== false,
+            maxRetries: request?.maxRetries,
+            retryBaseDelayMs: request?.retryBaseDelayMs,
+            retryMaxDelayMs: request?.retryMaxDelayMs,
             onProgress(progress) {
               bridgeEvent("youtubeDataProgress", progress, id);
             },
