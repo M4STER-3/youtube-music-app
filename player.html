@@ -47,11 +47,12 @@
     "use strict";
 
     const BRIDGE_CHANNEL = "focus-hub-youtube";
-    const PLAYER_API_VERSION = "1.1.0";
+    const PLAYER_API_VERSION = "1.2.0";
     const PROGRESS_INTERVAL_MS = 250;
     const PLAYLIST_RECOVERY_DELAY_MS = 900;
     const PLAYLIST_STALL_MS = 2600;
     const PAUSE_CONFIRM_DELAY_MS = 1200;
+    const ERROR_SKIP_DELAY_MS = 450;
 
     const VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
     const PLAYLIST_ID_PATTERN = /^[A-Za-z0-9_-]{6,120}$/;
@@ -73,6 +74,15 @@
       [5]: "cued",
     });
 
+    const YT_ERROR_INFO = Object.freeze({
+      2: Object.freeze({ key: "invalidParameter", message: "Paramètre ou identifiant vidéo invalide", recoverable: false }),
+      5: Object.freeze({ key: "html5PlaybackError", message: "Erreur du lecteur HTML5 YouTube", recoverable: true }),
+      100: Object.freeze({ key: "videoUnavailable", message: "Vidéo supprimée, privée ou introuvable", recoverable: false }),
+      101: Object.freeze({ key: "embeddingForbidden", message: "Le propriétaire interdit la lecture intégrée", recoverable: false }),
+      150: Object.freeze({ key: "embeddingForbidden", message: "Le propriétaire interdit la lecture intégrée", recoverable: false }),
+      153: Object.freeze({ key: "missingClientIdentification", message: "Identification du client ou Referer manquant", recoverable: false }),
+    });
+
     function resolveTrustedOrigin() {
       try {
         const origin = String(window.location.origin || "");
@@ -80,6 +90,14 @@
       } catch {
         return "";
       }
+    }
+
+    function getYouTubeErrorInfo(code) {
+      const numeric = Number(code) || 0;
+      const known = YT_ERROR_INFO[numeric];
+      return known
+        ? { code: numeric, ...known }
+        : { code: numeric, key: "unknownYouTubeError", message: "Erreur YouTube inconnue", recoverable: false };
     }
 
     // Android loads this document with loadDataWithBaseURL("https://app.local/player.html", ...).
@@ -104,6 +122,7 @@
     let playbackIntent = false;
     let loopEnabled = false;
     let shuffleEnabled = false;
+    let autoplayBlocked = false;
     let presentationMode = params.get("presentation") === "background" ? "background" : "mini";
     let lastPlayerSize = "";
     let playerResizeFrame = 0;
@@ -114,6 +133,10 @@
     let playlistStallSince = 0;
     let pauseIntentTimer = 0;
     let restoringPlayer = false;
+    let lastAppliedLoop = null;
+    let lastAppliedShuffle = null;
+    let shuffleRuntimeSignature = "";
+    const shuffleVisitedPositions = new Set();
     const pendingCommands = [];
 
     function stateName(state) {
@@ -167,6 +190,32 @@
       return Math.max(0, playlistPosition);
     }
 
+    function resetShuffleCycle() {
+      shuffleVisitedPositions.clear();
+      shuffleRuntimeSignature = "";
+    }
+
+    function markShuffleVisit() {
+      if (!shuffleEnabled || mediaType !== "playlist" || !playerReady || !player) return;
+      const runtime = getRuntimePlaylist();
+      const currentIndex = getPlaylistIndex();
+      if (!runtime.length || currentIndex < 0 || currentIndex >= runtime.length) return;
+
+      const signature = runtime.join("|");
+      if (shuffleRuntimeSignature && shuffleRuntimeSignature !== signature) {
+        shuffleVisitedPositions.clear();
+      }
+      shuffleRuntimeSignature = signature;
+      shuffleVisitedPositions.add(`${currentIndex}:${runtime[currentIndex] || getCurrentVideoId()}`);
+    }
+
+    function isShuffleCycleComplete() {
+      if (!shuffleEnabled || loopEnabled || mediaType !== "playlist") return false;
+      markShuffleVisit();
+      const runtime = getRuntimePlaylist();
+      return runtime.length > 0 && shuffleVisitedPositions.size >= runtime.length;
+    }
+
     function getProgressSnapshot() {
       if (!playerReady || !player) {
         return {
@@ -209,6 +258,7 @@
           loadedFraction: 0,
           loopEnabled,
           shuffleEnabled,
+          autoplayBlocked,
         };
       }
 
@@ -239,6 +289,8 @@
         canonicalPlaylist: [...canonicalPlaylistIds],
         loopEnabled,
         shuffleEnabled,
+        autoplayBlocked,
+        shuffleVisitedCount: shuffleEnabled ? shuffleVisitedPositions.size : 0,
       };
     }
 
@@ -304,6 +356,7 @@
     function setPlaybackIntent(shouldPlay) {
       clearPauseIntentTimer();
       playbackIntent = !!shouldPlay;
+      if (shouldPlay) autoplayBlocked = false;
     }
 
     function observePausedPlaybackIntent() {
@@ -329,10 +382,33 @@
       playlistEndedTimer = 0;
     }
 
-    function applyPlaylistModes() {
+    function publishPlaylistEnded(reason = "ended") {
+      setPlaybackIntent(false);
+      clearPlaylistEndedRecovery();
+      postBridgeEvent("playlistEnded", {
+        ...getPlayerSnapshot(),
+        reason,
+      });
+    }
+
+    function applyPlaylistModes(force = false) {
       if (!playerReady || !player || mediaType !== "playlist") return;
-      player.setLoop?.(loopEnabled);
-      player.setShuffle?.(shuffleEnabled);
+
+      if (force || lastAppliedLoop !== loopEnabled) {
+        player.setLoop?.(loopEnabled);
+        lastAppliedLoop = loopEnabled;
+      }
+
+      if (force || lastAppliedShuffle !== shuffleEnabled) {
+        player.setShuffle?.(shuffleEnabled);
+        lastAppliedShuffle = shuffleEnabled;
+        resetShuffleCycle();
+        window.setTimeout(() => {
+          if (!playerReady || !player || mediaType !== "playlist") return;
+          if (shuffleEnabled) markShuffleVisit();
+          publishState("playlistMode");
+        }, 120);
+      }
     }
 
     function seekToSeconds(seconds, allowSeekAhead = true) {
@@ -356,7 +432,10 @@
     function loadVideoMedia(value = {}) {
       const nextVideoId = String(value.videoId || "");
       if (!VIDEO_ID_PATTERN.test(nextVideoId)) {
-        postBridgeEvent("error", { code: 2, message: "Identifiant vidéo YouTube invalide" });
+        postBridgeEvent("error", {
+          ...getYouTubeErrorInfo(2),
+          message: "Identifiant vidéo YouTube invalide",
+        });
         return false;
       }
 
@@ -366,6 +445,9 @@
       playlistPosition = 0;
       videoId = nextVideoId;
       lastPublishedVideoId = "";
+      lastAppliedLoop = null;
+      lastAppliedShuffle = null;
+      resetShuffleCycle();
       const autoplay = value.autoplay !== false;
       const startSeconds = Math.max(0, Number(value.startSeconds) || 0);
       setPlaybackIntent(autoplay);
@@ -382,7 +464,10 @@
         : "";
       const nextPlaylistIds = normalizeVideoIds(value.playlistIds);
       if (!nextPlaylistId && !nextPlaylistIds.length) {
-        postBridgeEvent("error", { code: 2, message: "Playlist YouTube invalide ou vide" });
+        postBridgeEvent("error", {
+          ...getYouTubeErrorInfo(2),
+          message: "Playlist YouTube invalide ou vide",
+        });
         return false;
       }
 
@@ -396,6 +481,9 @@
       if (typeof value.loop === "boolean") loopEnabled = value.loop;
       if (typeof value.shuffle === "boolean") shuffleEnabled = value.shuffle;
       lastPublishedVideoId = "";
+      lastAppliedLoop = null;
+      lastAppliedShuffle = null;
+      resetShuffleCycle();
 
       const autoplay = value.autoplay !== false;
       const startSeconds = Math.max(0, Number(value.startSeconds) || 0);
@@ -415,7 +503,7 @@
         else player.cuePlaylist?.(request);
       }
 
-      window.setTimeout(applyPlaylistModes, 250);
+      window.setTimeout(() => applyPlaylistModes(true), 250);
       return true;
     }
 
@@ -433,16 +521,20 @@
 
       const runtime = getRuntimePlaylist();
       const currentIndex = getPlaylistIndex();
-      if (runtime.length && !loopEnabled && !shuffleEnabled) {
-        if (direction > 0 && currentIndex >= runtime.length - 1 && reason === "ended") {
-          setPlaybackIntent(false);
-          publishState("playlistEnded");
+      if (runtime.length && !loopEnabled && direction > 0 && reason !== "manual") {
+        if (!shuffleEnabled && currentIndex >= runtime.length - 1) {
+          publishPlaylistEnded(reason);
           return false;
         }
-        if (direction < 0 && currentIndex <= 0) {
-          player.playVideoAt?.(0);
-          return true;
+        if (shuffleEnabled && isShuffleCycleComplete()) {
+          publishPlaylistEnded(reason === "error" ? "allShuffleItemsVisitedAfterErrors" : "shuffleCycleComplete");
+          return false;
         }
+      }
+
+      if (runtime.length && direction < 0 && !shuffleEnabled && currentIndex <= 0) {
+        player.playVideoAt?.(0);
+        return true;
       }
 
       if (direction < 0) player.previousVideo?.();
@@ -618,14 +710,26 @@
           if (value) player.mute?.();
           else player.unMute?.();
           break;
-        case "setLoop":
-          loopEnabled = !!value;
+        case "setLoop": {
+          const nextLoop = !!value;
+          if (loopEnabled !== nextLoop) {
+            loopEnabled = nextLoop;
+            lastAppliedLoop = null;
+            if (!loopEnabled && shuffleEnabled) resetShuffleCycle();
+          }
           if (mediaType === "playlist") applyPlaylistModes();
           break;
-        case "setShuffle":
-          shuffleEnabled = !!value;
+        }
+        case "setShuffle": {
+          const nextShuffle = !!value;
+          if (shuffleEnabled !== nextShuffle) {
+            shuffleEnabled = nextShuffle;
+            lastAppliedShuffle = null;
+            resetShuffleCycle();
+          }
           if (mediaType === "playlist") applyPlaylistModes();
           break;
+        }
         case "setPresentationMode":
           recreatePlayerForPresentation(value);
           return true;
@@ -687,6 +791,7 @@
       getProgress() { return getProgressSnapshot(); },
       getCurrentTime() { return getProgressSnapshot().currentTime; },
       getDuration() { return getProgressSnapshot().duration; },
+      getErrorInfo(code) { return getYouTubeErrorInfo(code); },
     });
 
     window.addEventListener("message", (event) => {
@@ -702,6 +807,7 @@
     function onPlayerReady(generation, restoreSnapshot = null) {
       if (generation !== playerGeneration) return;
       playerReady = true;
+      autoplayBlocked = false;
       const iframe = player.getIframe?.();
       if (iframe) {
         iframe.referrerPolicy = "strict-origin-when-cross-origin";
@@ -733,11 +839,15 @@
       const semanticEvent = stateName(state);
 
       if (state === YT_STATE.PLAYING) {
+        autoplayBlocked = false;
         setPlaybackIntent(true);
         playlistStallSince = 0;
         clearPlaylistEndedRecovery();
         publishVideoChangedIfNeeded();
-        if (mediaType === "playlist") applyPlaylistModes();
+        if (mediaType === "playlist") {
+          applyPlaylistModes();
+          markShuffleVisit();
+        }
       } else if (state === YT_STATE.BUFFERING) {
         clearPauseIntentTimer();
         clearPlaylistEndedRecovery();
@@ -760,6 +870,7 @@
             setPlaybackIntent(false);
           }
         } else if (mediaType === "playlist") {
+          markShuffleVisit();
           schedulePlaylistEndedRecovery(generation);
         }
       }
@@ -770,9 +881,36 @@
 
     function onPlayerError(event, generation) {
       if (generation !== playerGeneration) return;
+      const info = getYouTubeErrorInfo(event.data);
       postBridgeEvent("error", {
         ...getPlayerSnapshot(),
-        code: Number(event.data) || 0,
+        ...info,
+      });
+
+      if (
+        mediaType === "playlist" &&
+        playbackIntent &&
+        [100, 101, 150].includes(info.code)
+      ) {
+        markShuffleVisit();
+        window.setTimeout(() => {
+          if (generation !== playerGeneration || !playerReady || !player || !playbackIntent) return;
+          advancePlaylist(1, "error");
+        }, ERROR_SKIP_DELAY_MS);
+      }
+    }
+
+    function onAutoplayBlocked(generation) {
+      if (generation !== playerGeneration) return;
+      clearPlaylistEndedRecovery();
+      clearPauseIntentTimer();
+      playbackIntent = false;
+      autoplayBlocked = true;
+      postBridgeEvent("autoplayBlocked", {
+        ...getPlayerSnapshot(),
+        code: "autoplayBlocked",
+        message: "La lecture automatique a été bloquée. Une action utilisateur est requise.",
+        requiresUserAction: true,
       });
     }
 
@@ -803,6 +941,7 @@
           onReady: () => onPlayerReady(generation, restoreSnapshot),
           onStateChange: (event) => onPlayerStateChange(event, generation),
           onError: (event) => onPlayerError(event, generation),
+          onAutoplayBlocked: () => onAutoplayBlocked(generation),
         },
       });
     }
@@ -869,6 +1008,8 @@
     youtubeApiScript.referrerPolicy = "strict-origin-when-cross-origin";
     youtubeApiScript.onerror = () => postBridgeEvent("error", {
       code: 5,
+      key: "iframeApiUnavailable",
+      recoverable: true,
       message: "API YouTube inaccessible",
     });
     document.head.appendChild(youtubeApiScript);
