@@ -2,19 +2,9 @@
 <html lang="fr">
 <head>
   <meta charset="UTF-8">
-
-  <meta
-    name="viewport"
-    content="width=device-width, initial-scale=1"
-  >
-
-  <meta
-    name="referrer"
-    content="strict-origin-when-cross-origin"
-  >
-
-  <title>Lecteur YouTube</title>
-
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="strict-origin-when-cross-origin">
+  <title>YouTube Player Engine</title>
   <style>
     html,
     body {
@@ -50,569 +40,400 @@
     }
   </style>
 </head>
-
 <body>
   <div id="player"></div>
 
   <script>
     "use strict";
 
+    // Stable bridge contract used by the browser host today and by the Android WebView later.
     const BRIDGE_CHANNEL = "focus-hub-youtube";
+    const PLAYER_API_VERSION = "1.0.0";
+    const PROGRESS_INTERVAL_MS = 250;
+    const PLAYLIST_RECOVERY_DELAY_MS = 900;
+    const PLAYLIST_STALL_MS = 2600;
+
+    const VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
+    const PLAYLIST_ID_PATTERN = /^[A-Za-z0-9_-]{6,120}$/;
+    const YT_STATE = Object.freeze({
+      UNSTARTED: -1,
+      ENDED: 0,
+      PLAYING: 1,
+      PAUSED: 2,
+      BUFFERING: 3,
+      CUED: 5,
+    });
+
+    const YT_STATE_NAMES = Object.freeze({
+      [-1]: "unstarted",
+      [0]: "ended",
+      [1]: "playing",
+      [2]: "paused",
+      [3]: "buffering",
+      [5]: "cued",
+    });
+
     const params = new URLSearchParams(window.location.search);
-    const rawPlaylistId = params.get("playlist") || "";
-    const rawVideoId = params.get("video") || "";
-    const playlistIdPattern = /^[A-Za-z0-9_-]{6,120}$/;
-    const videoIdPattern = /^[A-Za-z0-9_-]{11}$/;
-    let playlistId = playlistIdPattern.test(rawPlaylistId) ? rawPlaylistId : "";
-    let videoId = videoIdPattern.test(rawVideoId) ? rawVideoId : "";
-    let mediaType = playlistId ? "playlist" : (videoId ? "video" : "");
+    const initialRawPlaylistId = params.get("playlist") || "";
+    const initialRawVideoId = params.get("video") || "";
+    const initialPlaylistId = PLAYLIST_ID_PATTERN.test(initialRawPlaylistId) ? initialRawPlaylistId : "";
+    const initialVideoId = VIDEO_ID_PATTERN.test(initialRawVideoId) ? initialRawVideoId : "";
     const initialPlaylistIndex = Math.max(0, Number.parseInt(params.get("index") || "0", 10) || 0);
-    const playerContainer = document.getElementById("player");
-    let presentationMode = params.get("presentation") === "background" ? "background" : "mini";
 
     let player = null;
     let playerReady = false;
     let playerGeneration = 0;
+    let mediaType = initialPlaylistId ? "playlist" : (initialVideoId ? "video" : "");
+    let playlistId = initialPlaylistId;
+    let videoId = initialVideoId;
+    let playlistPosition = initialPlaylistIndex;
+    let canonicalPlaylistIds = [];
+    let playbackIntent = false;
     let loopEnabled = false;
     let shuffleEnabled = false;
-    let playbackIntent = false;
-    let playlistPosition = initialPlaylistIndex;
-    let parentOrigin = "*";
-    let lastVolumeSignature = "";
-    let playerResizeFrame = 0;
+    let presentationMode = params.get("presentation") === "background" ? "background" : "mini";
     let lastPlayerSize = "";
+    let playerResizeFrame = 0;
+    let lastVolumeSignature = "";
+    let lastProgressSignature = "";
+    let lastPublishedVideoId = "";
     let playlistEndedTimer = 0;
-    let playlistEndedRecoveryTimer = 0;
-    let playlistEndedSequence = 0;
-    let playlistModesPending = false;
-    let playlistNavigationPending = 0;
-    let playlistNavigationTimer = 0;
-    let playlistNavigationSequence = 0;
-    let activePlaylistNavigation = null;
-    let playbackIntentPauseTimer = 0;
-    let playbackIntentProtectedUntil = 0;
-    let playbackPausedWhileHidden = false;
-    let canonicalPlaylistIds = [];
-    let initialMediaLoadTimer = 0;
-    let initialMediaCommandReceived = false;
     let playlistStallSince = 0;
-    let lastPlaylistRecoveryAt = 0;
-    let lastPlaylistHeartbeatSignature = "";
-    const shuffleCycleHandledVideoIds = new Set();
+    let restoringPlayer = false;
     const pendingCommands = [];
 
-    try {
-      const referrerOrigin = document.referrer ? new URL(document.referrer).origin : "";
-      if (/^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(referrerOrigin)) {
-        parentOrigin = referrerOrigin;
-      }
-    } catch {
-      parentOrigin = "*";
+    function stateName(state) {
+      return YT_STATE_NAMES[Number(state)] || "unknown";
     }
 
-    function postBridgeEvent(event, data = {}) {
-      if (window.parent === window) return;
-      window.parent.postMessage({
-        channel: BRIDGE_CHANNEL,
-        kind: "event",
-        event,
-        mediaType,
-        videoId,
-        playlistId,
-        data,
-      }, parentOrigin);
+    function clampNumber(value, minimum, maximum = Number.POSITIVE_INFINITY) {
+      const parsed = Number(value);
+      if (!Number.isFinite(parsed)) return minimum;
+      return Math.min(maximum, Math.max(minimum, parsed));
+    }
+
+    function normalizeVideoIds(ids) {
+      if (!Array.isArray(ids)) return [];
+      return [...new Set(ids
+        .map((id) => String(id || ""))
+        .filter((id) => VIDEO_ID_PATTERN.test(id)))]
+        .slice(0, 5000);
     }
 
     function getCurrentVideoId() {
-      const videoDataId = String(player?.getVideoData?.()?.video_id || "");
-      if (videoIdPattern.test(videoDataId)) return videoDataId;
+      const dataId = String(player?.getVideoData?.()?.video_id || "");
+      if (VIDEO_ID_PATTERN.test(dataId)) return dataId;
       try {
         const playerUrl = new URL(String(player?.getVideoUrl?.() || ""));
         const urlId = String(playerUrl.searchParams.get("v") || "");
-        return videoIdPattern.test(urlId) ? urlId : "";
+        return VIDEO_ID_PATTERN.test(urlId) ? urlId : "";
       } catch {
         return "";
       }
     }
 
-    function getPlayerSnapshot() {
-      if (!playerReady || !player) return {};
-      const videoData = player.getVideoData?.() || {};
-      const playlist = player.getPlaylist?.();
-      const reportedPlaylistIndex = Number(player.getPlaylistIndex?.());
-      if (Number.isFinite(reportedPlaylistIndex) && reportedPlaylistIndex >= 0) {
-        playlistPosition = reportedPlaylistIndex;
+    function getRuntimePlaylist() {
+      const runtime = player?.getPlaylist?.();
+      if (Array.isArray(runtime) && runtime.length) {
+        return runtime.map((id) => String(id || "")).filter((id) => VIDEO_ID_PATTERN.test(id));
       }
-      const currentVideoId = getCurrentVideoId();
-      const canonicalPlaylistIndex = currentVideoId
-        ? canonicalPlaylistIds.indexOf(currentVideoId)
-        : -1;
+      return [...canonicalPlaylistIds];
+    }
+
+    function getPlaylistIndex() {
+      const reported = Number(player?.getPlaylistIndex?.());
+      if (Number.isFinite(reported) && reported >= 0) {
+        playlistPosition = Math.floor(reported);
+        return playlistPosition;
+      }
+      const currentId = getCurrentVideoId();
+      const runtime = getRuntimePlaylist();
+      const found = currentId ? runtime.indexOf(currentId) : -1;
+      if (found >= 0) playlistPosition = found;
+      return Math.max(0, playlistPosition);
+    }
+
+    function getProgressSnapshot() {
+      if (!playerReady || !player) {
+        return {
+          state: YT_STATE.UNSTARTED,
+          stateName: "unstarted",
+          currentVideoId: "",
+          currentTime: 0,
+          duration: 0,
+          progress: 0,
+          loadedFraction: 0,
+        };
+      }
+
+      const state = Number(player.getPlayerState?.());
+      const currentTime = Math.max(0, Number(player.getCurrentTime?.()) || 0);
+      const duration = Math.max(0, Number(player.getDuration?.()) || 0);
+      const loadedFraction = clampNumber(player.getVideoLoadedFraction?.(), 0, 1);
       return {
-        state: player.getPlayerState?.(),
-        shouldPlay: playbackIntent || player.getPlayerState?.() === 1 || player.getPlayerState?.() === 3,
-        volume: player.getVolume?.(),
-        muted: !!player.isMuted?.(),
-        playlistIndex: playlistPosition,
-        playlistLength: Array.isArray(playlist) ? playlist.length : 0,
-        playlist: Array.isArray(playlist) ? playlist : [],
-        currentVideoId,
-        canonicalPlaylistIndex,
-        canonicalPlaylistLength: canonicalPlaylistIds.length,
-        canonicalPlaylist: [...canonicalPlaylistIds],
-        currentTime: Math.max(0, Number(player.getCurrentTime?.()) || 0),
+        state,
+        stateName: stateName(state),
+        currentVideoId: getCurrentVideoId(),
+        currentTime,
+        duration,
+        progress: duration > 0 ? clampNumber(currentTime / duration, 0, 1) : 0,
+        loadedFraction,
+      };
+    }
+
+    function getPlayerSnapshot() {
+      if (!playerReady || !player) {
+        return {
+          apiVersion: PLAYER_API_VERSION,
+          ready: false,
+          mediaType,
+          playlistId,
+          currentVideoId: "",
+          currentTime: 0,
+          duration: 0,
+          progress: 0,
+          loadedFraction: 0,
+          loopEnabled,
+          shuffleEnabled,
+        };
+      }
+
+      const videoData = player.getVideoData?.() || {};
+      const runtimePlaylist = getRuntimePlaylist();
+      const progressData = getProgressSnapshot();
+      return {
+        apiVersion: PLAYER_API_VERSION,
+        ready: true,
+        mediaType,
+        playlistId,
+        state: progressData.state,
+        stateName: progressData.stateName,
+        shouldPlay: playbackIntent || [YT_STATE.PLAYING, YT_STATE.BUFFERING].includes(progressData.state),
+        currentVideoId: progressData.currentVideoId,
+        currentTime: progressData.currentTime,
+        duration: progressData.duration,
+        progress: progressData.progress,
+        loadedFraction: progressData.loadedFraction,
         title: videoData.title || "",
         author: videoData.author || "",
+        volume: clampNumber(player.getVolume?.(), 0, 100),
+        muted: !!player.isMuted?.(),
+        playlistIndex: getPlaylistIndex(),
+        playlistLength: runtimePlaylist.length,
+        playlist: runtimePlaylist,
+        canonicalPlaylistLength: canonicalPlaylistIds.length,
+        canonicalPlaylist: [...canonicalPlaylistIds],
         loopEnabled,
         shuffleEnabled,
       };
+    }
+
+    function buildBridgePayload(event, data = {}) {
+      return {
+        channel: BRIDGE_CHANNEL,
+        kind: "event",
+        event,
+        apiVersion: PLAYER_API_VERSION,
+        mediaType,
+        videoId: getCurrentVideoId() || videoId,
+        playlistId,
+        timestamp: Date.now(),
+        data,
+      };
+    }
+
+    function postBridgeEvent(event, data = {}) {
+      const payload = buildBridgePayload(event, data);
+
+      // Direct same-page API for tests and WebView evaluateJavascript consumers.
+      window.dispatchEvent(new CustomEvent("youtube-player-event", { detail: payload }));
+
+      // Existing iframe/browser integration remains supported.
+      if (window.parent !== window) {
+        window.parent.postMessage(payload, "*");
+      }
     }
 
     function publishState(event = "state") {
       postBridgeEvent(event, getPlayerSnapshot());
     }
 
+    function publishProgress(force = false) {
+      if (!playerReady || !player) return;
+      const progress = getProgressSnapshot();
+      const signature = [
+        progress.state,
+        progress.currentVideoId,
+        progress.duration.toFixed(3),
+        progress.currentTime.toFixed(2),
+        progress.loadedFraction.toFixed(3),
+      ].join("|");
+
+      if (!force && signature === lastProgressSignature) return;
+      lastProgressSignature = signature;
+      postBridgeEvent("progress", progress);
+    }
+
+    function publishVideoChangedIfNeeded(force = false) {
+      const currentId = getCurrentVideoId();
+      if (!currentId) return;
+      if (!force && currentId === lastPublishedVideoId) return;
+      lastPublishedVideoId = currentId;
+      videoId = currentId;
+      publishState("videoChanged");
+    }
+
+    function setPlaybackIntent(shouldPlay) {
+      playbackIntent = !!shouldPlay;
+    }
+
     function clearPlaylistEndedRecovery() {
       window.clearTimeout(playlistEndedTimer);
-      window.clearTimeout(playlistEndedRecoveryTimer);
       playlistEndedTimer = 0;
-      playlistEndedRecoveryTimer = 0;
-      playlistEndedSequence += 1;
     }
 
-    function setPlaybackIntent(shouldPlay, protectMs = 0) {
-      window.clearTimeout(playbackIntentPauseTimer);
-      playbackIntentPauseTimer = 0;
-      playbackIntent = !!shouldPlay;
-      playbackIntentProtectedUntil = playbackIntent && protectMs > 0
-        ? Date.now() + protectMs
-        : 0;
-    }
-
-    function observePausedPlaybackIntent(generation) {
-      window.clearTimeout(playbackIntentPauseTimer);
-      playbackIntentPauseTimer = 0;
-      if (!playbackIntent || activePlaylistNavigation) return;
-      if (document.hidden) {
-        playbackPausedWhileHidden = true;
-        return;
-      }
-      const remaining = Math.max(1500, playbackIntentProtectedUntil - Date.now());
-      playbackIntentPauseTimer = window.setTimeout(() => {
-        playbackIntentPauseTimer = 0;
-        if (document.hidden) {
-          playbackPausedWhileHidden = true;
-          return;
-        }
-        if (
-          generation === playerGeneration &&
-          playerReady &&
-          player?.getPlayerState?.() === 2 &&
-          !activePlaylistNavigation
-        ) playbackIntent = false;
-      }, remaining + 50);
-    }
-
-    function clearPlaylistNavigation() {
-      window.clearTimeout(playlistNavigationTimer);
-      playlistNavigationTimer = 0;
-      activePlaylistNavigation = null;
-      playlistNavigationSequence += 1;
-    }
-
-    function getSafePlaylistState() {
-      const playlist = player?.getPlaylist?.();
-      const index = Number(player?.getPlaylistIndex?.());
-      return {
-        playlist: Array.isArray(playlist) ? playlist : [],
-        index: Number.isFinite(index) && index >= 0 ? Math.floor(index) : Math.max(0, playlistPosition),
-        videoId: getCurrentVideoId(),
-      };
-    }
-
-    function isPlayerNearVideoEnd() {
-      const duration = Math.max(0, Number(player?.getDuration?.()) || 0);
-      const currentTime = Math.max(0, Number(player?.getCurrentTime?.()) || 0);
-      return duration > 0 && currentTime >= Math.max(0, duration - 1.25);
-    }
-
-    function resetShuffleCycle(currentVideoId = "") {
-      shuffleCycleHandledVideoIds.clear();
-      const cleanId = String(currentVideoId || "");
-      if (shuffleEnabled && videoIdPattern.test(cleanId)) {
-        shuffleCycleHandledVideoIds.add(cleanId);
-      }
-    }
-
-    function markShuffleCycleVideoHandled(currentVideoId = "") {
-      if (!shuffleEnabled) return;
-      const cleanId = String(currentVideoId || "");
-      if (videoIdPattern.test(cleanId)) shuffleCycleHandledVideoIds.add(cleanId);
-    }
-
-    function getShuffleCycleCandidates(current = getSafePlaylistState()) {
-      const runtimeIds = current.playlist
-        .map((id) => String(id || ""))
-        .filter((id) => videoIdPattern.test(id));
-      const source = runtimeIds.length
-        ? runtimeIds
-        : canonicalPlaylistIds.filter((id) => videoIdPattern.test(String(id || "")));
-      return source.filter((id) => !shuffleCycleHandledVideoIds.has(id));
-    }
-
-    function shuffleCycleIsComplete(current = getSafePlaylistState()) {
-      if (!shuffleEnabled) return false;
-      const source = current.playlist.length ? current.playlist : canonicalPlaylistIds;
-      const knownIds = [...new Set(source
-        .map((id) => String(id || ""))
-        .filter((id) => videoIdPattern.test(id)))];
-      return knownIds.length > 0 && knownIds.every((id) => shuffleCycleHandledVideoIds.has(id));
-    }
-
-    function markPlaylistModesPending() {
-      if (mediaType === "playlist") playlistModesPending = true;
-    }
-
-    function applyPlaylistModes(force = false) {
-      if (!playerReady || !player || mediaType !== "playlist") return false;
-      if (!force && !playlistModesPending) return false;
-      const playlist = player.getPlaylist?.();
-      const state = Number(player.getPlayerState?.());
-      const playlistReady = (Array.isArray(playlist) && playlist.length > 0) || state === 1 || state === 5;
-      if (!playlistReady) {
-        playlistModesPending = true;
-        if (force) {
-          player.setLoop?.(loopEnabled);
-          player.setShuffle?.(shuffleEnabled);
-        }
-        return false;
-      }
-      if (!canonicalPlaylistIds.length && Array.isArray(playlist) && playlist.length) {
-        canonicalPlaylistIds = playlist
-          .map((id) => String(id || ""))
-          .filter((id) => videoIdPattern.test(id));
-      }
-      playlistModesPending = false;
+    function applyPlaylistModes() {
+      if (!playerReady || !player || mediaType !== "playlist") return;
       player.setLoop?.(loopEnabled);
       player.setShuffle?.(shuffleEnabled);
-      const pendingDirection = playlistNavigationPending;
-      if (pendingDirection && Array.isArray(playlist) && playlist.length) {
-        playlistNavigationPending = 0;
-        const generation = playerGeneration;
-        window.setTimeout(() => {
-          if (generation !== playerGeneration || !playerReady || !player) return;
-          startPlaylistNavigation(pendingDirection, "pending");
-        }, 0);
-      }
+    }
+
+    function seekToSeconds(seconds, allowSeekAhead = true) {
+      if (!playerReady || !player) return false;
+      const duration = Math.max(0, Number(player.getDuration?.()) || 0);
+      const requested = Math.max(0, Number(seconds) || 0);
+      const target = duration > 0 ? Math.min(requested, duration) : requested;
+      player.seekTo?.(target, allowSeekAhead !== false);
+      window.setTimeout(() => {
+        publishProgress(true);
+        publishState("seeked");
+      }, 60);
       return true;
     }
 
-    function loadPlaylistSourceAt(index, autoplay = true, startSeconds = 0, preferredVideoId = "") {
-      if (!playlistId) return false;
-      const playlist = canonicalPlaylistIds.filter((id) => videoIdPattern.test(String(id || "")));
-      const preferredIndex = videoIdPattern.test(String(preferredVideoId || ""))
-        ? playlist.indexOf(String(preferredVideoId))
-        : -1;
-      const requestedIndex = preferredIndex >= 0 ? preferredIndex : Math.max(0, Number(index) || 0);
-      playlistPosition = playlist.length
-        ? Math.min(requestedIndex, playlist.length - 1)
-        : requestedIndex;
-      markPlaylistModesPending();
-      if (playlist.length) {
-        if (autoplay) player.loadPlaylist?.(playlist, playlistPosition, Math.max(0, Number(startSeconds) || 0));
-        else player.cuePlaylist?.(playlist, playlistPosition, Math.max(0, Number(startSeconds) || 0));
+    function seekBySeconds(offsetSeconds) {
+      const current = Math.max(0, Number(player?.getCurrentTime?.()) || 0);
+      return seekToSeconds(current + (Number(offsetSeconds) || 0), true);
+    }
+
+    function loadVideoMedia(value = {}) {
+      const nextVideoId = String(value.videoId || "");
+      if (!VIDEO_ID_PATTERN.test(nextVideoId)) {
+        postBridgeEvent("error", { code: 2, message: "Identifiant vidéo YouTube invalide" });
+        return false;
+      }
+
+      mediaType = "video";
+      playlistId = "";
+      canonicalPlaylistIds = [];
+      playlistPosition = 0;
+      videoId = nextVideoId;
+      lastPublishedVideoId = "";
+      const autoplay = value.autoplay !== false;
+      const startSeconds = Math.max(0, Number(value.startSeconds) || 0);
+      setPlaybackIntent(autoplay);
+
+      const request = { videoId: nextVideoId, startSeconds };
+      if (autoplay) player.loadVideoById?.(request);
+      else player.cueVideoById?.(request);
+      return true;
+    }
+
+    function loadPlaylistMedia(value = {}) {
+      const nextPlaylistId = PLAYLIST_ID_PATTERN.test(String(value.playlistId || ""))
+        ? String(value.playlistId)
+        : "";
+      const nextPlaylistIds = normalizeVideoIds(value.playlistIds);
+      if (!nextPlaylistId && !nextPlaylistIds.length) {
+        postBridgeEvent("error", { code: 2, message: "Playlist YouTube invalide ou vide" });
+        return false;
+      }
+
+      mediaType = "playlist";
+      playlistId = nextPlaylistId;
+      canonicalPlaylistIds = nextPlaylistIds;
+      playlistPosition = Math.max(0, Math.floor(Number(value.index) || 0));
+      if (canonicalPlaylistIds.length) {
+        playlistPosition = Math.min(playlistPosition, canonicalPlaylistIds.length - 1);
+      }
+      if (typeof value.loop === "boolean") loopEnabled = value.loop;
+      if (typeof value.shuffle === "boolean") shuffleEnabled = value.shuffle;
+      lastPublishedVideoId = "";
+
+      const autoplay = value.autoplay !== false;
+      const startSeconds = Math.max(0, Number(value.startSeconds) || 0);
+      setPlaybackIntent(autoplay);
+
+      if (canonicalPlaylistIds.length) {
+        if (autoplay) player.loadPlaylist?.(canonicalPlaylistIds, playlistPosition, startSeconds);
+        else player.cuePlaylist?.(canonicalPlaylistIds, playlistPosition, startSeconds);
       } else {
-        const command = {
+        const request = {
           listType: "playlist",
           list: playlistId,
           index: playlistPosition,
-          startSeconds: Math.max(0, Number(startSeconds) || 0),
+          startSeconds,
         };
-        if (autoplay) player.loadPlaylist?.(command);
-        else player.cuePlaylist?.(command);
+        if (autoplay) player.loadPlaylist?.(request);
+        else player.cuePlaylist?.(request);
       }
+
+      window.setTimeout(applyPlaylistModes, 250);
       return true;
     }
 
-    function reloadPlaylistAt(index, autoplay = true) {
-      return loadPlaylistSourceAt(index, autoplay);
+    function loadMedia(value = {}) {
+      clearPlaylistEndedRecovery();
+      playlistStallSince = 0;
+      if (value.type === "playlist") return loadPlaylistMedia(value);
+      return loadVideoMedia(value);
     }
 
-    function clearInitialMediaLoad() {
-      window.clearTimeout(initialMediaLoadTimer);
-      initialMediaLoadTimer = 0;
-    }
-
-    function scheduleInitialQueryMediaLoad(generation) {
-      clearInitialMediaLoad();
-      initialMediaLoadTimer = window.setTimeout(() => {
-        initialMediaLoadTimer = 0;
-        if (
-          generation !== playerGeneration ||
-          !playerReady ||
-          !player ||
-          initialMediaCommandReceived
-        ) return;
-        executeCommand({
-          command: "loadMedia",
-          value: mediaType === "playlist"
-            ? {
-                type: "playlist",
-                playlistId,
-                index: playlistPosition,
-                autoplay: true,
-                shuffle: shuffleEnabled,
-                loop: loopEnabled,
-              }
-            : { type: "video", videoId, autoplay: true },
-          source: "initial-query",
-        });
-      }, 300);
-    }
-
-    function recoverPlaylistPlayback(reason = "resume") {
-      if (
-        document.hidden ||
-        !playbackIntent ||
-        !playerReady ||
-        !player ||
-        mediaType !== "playlist" ||
-        !playlistId
-      ) return false;
-      const now = Date.now();
-      if (now - lastPlaylistRecoveryAt < 900) return false;
-      const state = Number(player.getPlayerState?.());
-      const current = getSafePlaylistState();
-      if (state === 1 || state === 3) {
-        playlistStallSince = 0;
-        return false;
-      }
-      lastPlaylistRecoveryAt = now;
-      if (state === 2 && current.videoId) {
-        if (current.playlist.length && isPlayerNearVideoEnd()) {
-          markShuffleCycleVideoHandled(current.videoId);
-          return startPlaylistNavigation(1, "ended");
-        }
-        setPlaybackIntent(true, 5000);
-        player.playVideo?.();
-        return true;
-      }
-      if (state === 0 && current.playlist.length) {
-        markShuffleCycleVideoHandled(current.videoId);
-        if (
-          !loopEnabled &&
-          ((!shuffleEnabled && current.index >= current.playlist.length - 1) ||
-            (shuffleEnabled && shuffleCycleIsComplete(current)))
-        ) {
-          setPlaybackIntent(false);
-          publishState("state");
-          return false;
-        }
-        return startPlaylistNavigation(1, "ended");
-      }
-      if (state === 5 && current.videoId && current.playlist.length) {
-        setPlaybackIntent(true, 5000);
-        player.playVideo?.();
-        return true;
-      }
-      const canonicalIndex = current.videoId
-        ? canonicalPlaylistIds.indexOf(current.videoId)
-        : -1;
-      const targetIndex = canonicalIndex >= 0 ? canonicalIndex : Math.max(0, playlistPosition);
-      setPlaybackIntent(true, 5000);
-      return loadPlaylistSourceAt(targetIndex, true, 0, current.videoId);
-    }
-
-    function playlistNavigationSucceeded(navigation, current = getSafePlaylistState()) {
-      if (!navigation) return false;
-      return (
-        (navigation.startVideoId && current.videoId && navigation.startVideoId !== current.videoId) ||
-        current.index !== navigation.startIndex
-      );
-    }
-
-    function getPlaylistNavigationTarget(navigation, current) {
-      const length = current.playlist.length;
-      if (!length) return Math.max(0, navigation.startIndex + navigation.direction);
-      if (navigation.reason === "ended" && navigation.direction > 0 && !loopEnabled) {
-        if (!shuffleEnabled && navigation.startIndex >= length - 1) return -1;
-        if (shuffleEnabled) {
-          if (
-            Number.isInteger(navigation.targetIndex) &&
-            navigation.targetIndex >= 0 &&
-            navigation.targetIndex < length
-          ) return navigation.targetIndex;
-          const candidates = getShuffleCycleCandidates(current);
-          if (!candidates.length) return -1;
-          const targetId = candidates[Math.floor(Math.random() * candidates.length)];
-          const targetIndex = current.playlist.indexOf(targetId);
-          if (targetIndex >= 0) {
-            navigation.targetIndex = targetIndex;
-            return targetIndex;
-          }
-        }
-      }
-      return (navigation.startIndex + navigation.direction + length) % length;
-    }
-
-    function runPlaylistNavigationAttempt(navigation) {
-      if (
-        !navigation ||
-        navigation.sequence !== playlistNavigationSequence ||
-        navigation.generation !== playerGeneration ||
-        !playerReady ||
-        !player ||
-        mediaType !== "playlist"
-      ) return;
-
-      const current = getSafePlaylistState();
-      if (playlistNavigationSucceeded(navigation, current)) {
-        if (playbackIntent && ![1, 3].includes(Number(player.getPlayerState?.()))) player.playVideo?.();
-        clearPlaylistNavigation();
-        return;
-      }
-
-      const targetIndex = getPlaylistNavigationTarget(navigation, current);
-      if (targetIndex < 0) {
-        setPlaybackIntent(false);
-        clearPlaylistNavigation();
-        publishState("state");
-        return;
-      }
-
-      navigation.attempt += 1;
-      playlistPosition = targetIndex;
-      if (navigation.attempt === 1) {
-        if (current.playlist.length) {
-          if (shuffleEnabled && navigation.reason === "ended") {
-            player.playVideoAt?.(targetIndex);
-            player.playVideo?.();
-          } else if (shuffleEnabled) {
-            if (navigation.direction < 0) player.previousVideo?.();
-            else player.nextVideo?.();
-          } else {
-            player.playVideoAt?.(targetIndex);
-          }
-        } else {
-          playlistNavigationPending = navigation.direction;
-          reloadPlaylistAt(navigation.startIndex, true);
-        }
-      } else if (current.playlist.length) {
-        player.playVideoAt?.(targetIndex);
-        player.playVideo?.();
-      } else if (canonicalPlaylistIds.length) {
-        const currentCanonicalIndex = navigation.startVideoId
-          ? canonicalPlaylistIds.indexOf(navigation.startVideoId)
-          : navigation.startIndex;
-        let canonicalTarget = Math.max(0, currentCanonicalIndex + navigation.direction);
-        if (shuffleEnabled && canonicalPlaylistIds.length > 1) {
-          const candidates = canonicalPlaylistIds
-            .map((_, index) => index)
-            .filter((index) => index !== currentCanonicalIndex);
-          canonicalTarget = candidates[Math.floor(Math.random() * candidates.length)];
-        } else if (canonicalPlaylistIds.length) {
-          canonicalTarget = (canonicalTarget + canonicalPlaylistIds.length) % canonicalPlaylistIds.length;
-        }
-        playlistPosition = canonicalTarget;
-        markPlaylistModesPending();
-        player.loadPlaylist?.(canonicalPlaylistIds, canonicalTarget, 0);
-      } else {
-        playlistNavigationPending = navigation.direction;
-        reloadPlaylistAt(navigation.startIndex, true);
-      }
-
-      const expectedSequence = navigation.sequence;
-      playlistNavigationTimer = window.setTimeout(() => {
-        playlistNavigationTimer = 0;
-        if (!activePlaylistNavigation || activePlaylistNavigation.sequence !== expectedSequence) return;
-        const latest = getSafePlaylistState();
-        if (playlistNavigationSucceeded(activePlaylistNavigation, latest)) {
-          if (playbackIntent && ![1, 3].includes(Number(player.getPlayerState?.()))) player.playVideo?.();
-          clearPlaylistNavigation();
-          return;
-        }
-        if (activePlaylistNavigation.attempt < 3) {
-          runPlaylistNavigationAttempt(activePlaylistNavigation);
-        } else {
-          clearPlaylistNavigation();
-          publishState("snapshot");
-        }
-      }, navigation.attempt === 1 ? 950 : 1500);
-    }
-
-    function startPlaylistNavigation(direction, reason = "manual") {
+    function advancePlaylist(direction = 1, reason = "manual") {
       if (!playerReady || !player || mediaType !== "playlist") return false;
       clearPlaylistEndedRecovery();
-      clearPlaylistNavigation();
-      setPlaybackIntent(true, 5000);
-      const current = getSafePlaylistState();
-      const sequence = playlistNavigationSequence;
-      activePlaylistNavigation = {
-        sequence,
-        generation: playerGeneration,
-        direction: direction < 0 ? -1 : 1,
-        reason,
-        startIndex: current.index,
-        startVideoId: current.videoId,
-        targetIndex: null,
-        attempt: 0,
-      };
-      runPlaylistNavigationAttempt(activePlaylistNavigation);
+      setPlaybackIntent(true);
+
+      const runtime = getRuntimePlaylist();
+      const currentIndex = getPlaylistIndex();
+      if (runtime.length && !loopEnabled && !shuffleEnabled) {
+        if (direction > 0 && currentIndex >= runtime.length - 1) {
+          if (reason === "ended") {
+            setPlaybackIntent(false);
+            publishState("playlistEnded");
+            return false;
+          }
+        }
+        if (direction < 0 && currentIndex <= 0) {
+          player.playVideoAt?.(0);
+          return true;
+        }
+      }
+
+      if (direction < 0) player.previousVideo?.();
+      else player.nextVideo?.();
       return true;
-    }
-
-    function advancePlaylistAfterEnded(expectedGeneration, expectedSequence, endedState) {
-      if (
-        expectedGeneration !== playerGeneration ||
-        expectedSequence !== playlistEndedSequence ||
-        !playerReady ||
-        !player ||
-        mediaType !== "playlist" ||
-        !playbackIntent ||
-        ![-1, 0, 2, 5].includes(player.getPlayerState?.())
-      ) return;
-
-      const current = getSafePlaylistState();
-      if (
-        (endedState.videoId && current.videoId && endedState.videoId !== current.videoId) ||
-        current.index !== endedState.index
-      ) {
-        playlistEndedRecoveryTimer = window.setTimeout(() => {
-          playlistEndedRecoveryTimer = 0;
-          if (
-            expectedGeneration !== playerGeneration ||
-            expectedSequence !== playlistEndedSequence ||
-            !playbackIntent
-          ) return;
-          recoverPlaylistPlayback("ended-index-advanced");
-        }, 450);
-        return;
-      }
-
-      const length = current.playlist.length;
-      markShuffleCycleVideoHandled(current.videoId || endedState.videoId);
-      if (
-        length &&
-        !loopEnabled &&
-        ((!shuffleEnabled && current.index >= length - 1) ||
-          (shuffleEnabled && shuffleCycleIsComplete(current)))
-      ) {
-        playbackIntent = false;
-        publishState("state");
-        return;
-      }
-
-      startPlaylistNavigation(1, "ended");
     }
 
     function schedulePlaylistEndedRecovery(generation) {
       clearPlaylistEndedRecovery();
       if (mediaType !== "playlist" || !playbackIntent) return;
-      const sequence = playlistEndedSequence;
-      const endedState = getSafePlaylistState();
+      const endedVideoId = getCurrentVideoId();
+      const endedIndex = getPlaylistIndex();
+
       playlistEndedTimer = window.setTimeout(() => {
         playlistEndedTimer = 0;
-        advancePlaylistAfterEnded(generation, sequence, endedState);
-      }, 850);
+        if (generation !== playerGeneration || !playerReady || !player || !playbackIntent) return;
+        const state = Number(player.getPlayerState?.());
+        const currentId = getCurrentVideoId();
+        const currentIndex = getPlaylistIndex();
+        if (state === YT_STATE.PLAYING || state === YT_STATE.BUFFERING) return;
+        if ((endedVideoId && currentId && endedVideoId !== currentId) || endedIndex !== currentIndex) {
+          player.playVideo?.();
+          return;
+        }
+        advancePlaylist(1, "ended");
+      }, PLAYLIST_RECOVERY_DELAY_MS);
     }
 
     function resizePlayer(requestedSize = null) {
@@ -644,135 +465,118 @@
       });
     }
 
-    function executeCommand(message) {
-      if (!playerReady || !player) {
-        pendingCommands.push(message);
-        return;
+    function restorePlayerSnapshot(snapshot) {
+      if (!snapshot || !playerReady || !player) return;
+      restoringPlayer = true;
+      loopEnabled = !!snapshot.loopEnabled;
+      shuffleEnabled = !!snapshot.shuffleEnabled;
+      const shouldPlay = snapshot.shouldPlay === true;
+      const currentTime = Math.max(0, Number(snapshot.currentTime) || 0);
+
+      if (snapshot.mediaType === "playlist") {
+        loadPlaylistMedia({
+          playlistId: snapshot.playlistId,
+          playlistIds: snapshot.canonicalPlaylist?.length ? snapshot.canonicalPlaylist : snapshot.playlist,
+          index: Math.max(0, Number(snapshot.playlistIndex) || 0),
+          startSeconds: currentTime,
+          autoplay: shouldPlay,
+          loop: loopEnabled,
+          shuffle: shuffleEnabled,
+        });
+      } else if (VIDEO_ID_PATTERN.test(String(snapshot.currentVideoId || ""))) {
+        loadVideoMedia({
+          videoId: snapshot.currentVideoId,
+          startSeconds: currentTime,
+          autoplay: shouldPlay,
+        });
       }
+
+      player.setVolume?.(clampNumber(snapshot.volume, 0, 100));
+      if (snapshot.muted) player.mute?.();
+      else player.unMute?.();
+      restoringPlayer = false;
+    }
+
+    function recreatePlayerForPresentation(nextMode) {
+      const cleanMode = nextMode === "background" ? "background" : "mini";
+      if (cleanMode === presentationMode) return;
+      const snapshot = getPlayerSnapshot();
+      presentationMode = cleanMode;
+      clearPlaylistEndedRecovery();
+      playerReady = false;
+      const previous = player;
+      player = null;
+      ++playerGeneration;
+      try {
+        previous?.destroy?.();
+      } catch {
+        // A fresh YT.Player below replaces any stale iframe.
+      }
+      ensurePlayerTarget();
+      createYoutubePlayer(snapshot);
+    }
+
+    function executeCommand(message = {}) {
       const command = String(message.command || "");
       const value = message.value;
+
+      if (!playerReady || !player) {
+        if (["getState", "getProgress"].includes(command)) return false;
+        pendingCommands.push({ command, value });
+        return false;
+      }
+
       switch (command) {
-        case "loadMedia": {
-          initialMediaCommandReceived = true;
-          clearInitialMediaLoad();
-          clearPlaylistEndedRecovery();
-          clearPlaylistNavigation();
-          playlistNavigationPending = 0;
-          playlistStallSince = 0;
-          playbackPausedWhileHidden = false;
-          const nextType = value?.type === "playlist" ? "playlist" : "video";
-          const nextPlaylistId = playlistIdPattern.test(String(value?.playlistId || ""))
-            ? String(value.playlistId)
-            : "";
-          const nextVideoId = videoIdPattern.test(String(value?.videoId || ""))
-            ? String(value.videoId)
-            : "";
-          const nextPlaylistIds = Array.isArray(value?.playlistIds)
-            ? value.playlistIds.map((id) => String(id || "")).filter((id) => videoIdPattern.test(id)).slice(0, 1000)
-            : [];
-          const autoplay = value?.autoplay !== false;
-          setPlaybackIntent(autoplay, autoplay ? 5000 : 0);
-          if (nextType === "playlist" && nextPlaylistId) {
-            mediaType = "playlist";
-            playlistId = nextPlaylistId;
-            videoId = "";
-            if (typeof value?.shuffle === "boolean") shuffleEnabled = value.shuffle;
-            if (typeof value?.loop === "boolean") loopEnabled = value.loop;
-            playlistPosition = Math.max(0, Number(value?.index) || 0);
-            canonicalPlaylistIds = [...nextPlaylistIds];
-            resetShuffleCycle();
-            loadPlaylistSourceAt(playlistPosition, autoplay);
-          } else if (nextVideoId) {
-            mediaType = "video";
-            playlistModesPending = false;
-            canonicalPlaylistIds = [];
-            videoId = nextVideoId;
-            playlistId = "";
-            if (autoplay) player.loadVideoById?.(videoId);
-            else player.cueVideoById?.(videoId);
-          } else {
-            postBridgeEvent("error", { code: 2, message: "Identifiant YouTube invalide" });
-            return;
-          }
+        case "loadMedia":
+          loadMedia(value || {});
           break;
-        }
         case "play":
-          setPlaybackIntent(true, 5000);
+          setPlaybackIntent(true);
           player.playVideo?.();
           break;
         case "pause":
           clearPlaylistEndedRecovery();
-          clearPlaylistNavigation();
           setPlaybackIntent(false);
           player.pauseVideo?.();
           break;
         case "toggle":
-          setPlaybackIntent(player.getPlayerState?.() !== 1, 5000);
-          if (playbackIntent) player.playVideo?.();
-          else {
-            clearPlaylistEndedRecovery();
-            clearPlaylistNavigation();
+          if (Number(player.getPlayerState?.()) === YT_STATE.PLAYING) {
+            setPlaybackIntent(false);
             player.pauseVideo?.();
+          } else {
+            setPlaybackIntent(true);
+            player.playVideo?.();
           }
           break;
         case "next":
-          if (mediaType === "playlist") {
-            startPlaylistNavigation(1, "manual");
-          } else {
-            setPlaybackIntent(true, 5000);
-            player.nextVideo?.();
-          }
+          advancePlaylist(1, "manual");
           break;
         case "previous":
+          advancePlaylist(-1, "manual");
+          break;
+        case "first":
           if (mediaType === "playlist") {
-            startPlaylistNavigation(-1, "manual");
-          } else {
-            setPlaybackIntent(true, 5000);
-            player.previousVideo?.();
+            setPlaybackIntent(true);
+            playlistPosition = 0;
+            player.playVideoAt?.(0);
           }
           break;
-        case "first": {
-          clearPlaylistEndedRecovery();
-          clearPlaylistNavigation();
-          if (mediaType !== "playlist" || !playlistId) break;
-          setPlaybackIntent(true, 5000);
-          resetShuffleCycle(canonicalPlaylistIds[0] || "");
-          const playlist = player.getPlaylist?.();
-          if (Array.isArray(playlist) && playlist.length) {
-            const canonicalFirstId = canonicalPlaylistIds[0] || "";
-            const runtimeFirstIndex = canonicalFirstId
-              ? playlist.indexOf(canonicalFirstId)
-              : 0;
-            if (runtimeFirstIndex >= 0) {
-              playlistPosition = runtimeFirstIndex;
-              player.playVideoAt?.(runtimeFirstIndex);
-            } else if (canonicalPlaylistIds.length) {
-              playlistPosition = 0;
-              playlistModesPending = true;
-              player.loadPlaylist?.(canonicalPlaylistIds, 0, 0);
-            } else {
-              playlistPosition = 0;
-              reloadPlaylistAt(0, true);
-            }
-          } else if (canonicalPlaylistIds.length) {
-            playlistPosition = 0;
-            playlistModesPending = true;
-            player.loadPlaylist?.(canonicalPlaylistIds, 0, 0);
-          } else {
-            playlistPosition = 0;
-            reloadPlaylistAt(0, true);
-          }
-          break;
-        }
         case "restart":
-          clearPlaylistEndedRecovery();
-          clearPlaylistNavigation();
-          setPlaybackIntent(true, 5000);
-          player.seekTo?.(0, true);
+          seekToSeconds(0, true);
+          setPlaybackIntent(true);
           player.playVideo?.();
           break;
+        case "seekTo":
+          seekToSeconds(
+            typeof value === "object" ? value?.seconds : value,
+            typeof value === "object" ? value?.allowSeekAhead !== false : true
+          );
+          return true;
+        case "seekBy":
+          seekBySeconds(typeof value === "object" ? value?.seconds : value);
+          return true;
         case "setVolume":
-          player.setVolume?.(Math.max(0, Math.min(100, Number(value) || 0)));
+          player.setVolume?.(clampNumber(value, 0, 100));
           break;
         case "setMuted":
           if (value) player.mute?.();
@@ -780,86 +584,78 @@
           break;
         case "setLoop":
           loopEnabled = !!value;
-          if (mediaType === "playlist") applyPlaylistModes(true);
+          if (mediaType === "playlist") applyPlaylistModes();
           break;
         case "setShuffle":
-          if (shuffleEnabled !== !!value) {
-            shuffleEnabled = !!value;
-            resetShuffleCycle(getCurrentVideoId());
-          }
-          if (mediaType === "playlist") applyPlaylistModes(true);
+          shuffleEnabled = !!value;
+          if (mediaType === "playlist") applyPlaylistModes();
           break;
         case "setPresentationMode":
-          recreatePlayerForPresentation(value === "background" ? "background" : "mini");
-          return;
+          recreatePlayerForPresentation(value);
+          return true;
         case "setViewportSize":
           schedulePlayerResize(value);
-          return;
+          return true;
         case "getState":
           publishState("snapshot");
-          return;
+          return true;
+        case "getProgress":
+          publishProgress(true);
+          return true;
         case "recover":
-          recoverPlaylistPlayback("parent-resume");
-          window.setTimeout(() => publishState("snapshot"), 120);
-          return;
+          if (playbackIntent && !document.hidden) player.playVideo?.();
+          window.setTimeout(() => publishState("snapshot"), 100);
+          return true;
         default:
-          return;
+          return false;
       }
+
       window.setTimeout(() => publishState("snapshot"), 80);
+      return true;
     }
 
-    window.addEventListener("message", (event) => {
-      if (event.source !== window.parent) return;
-      const message = event.data;
-      if (!message || message.channel !== BRIDGE_CHANNEL || message.kind !== "command") return;
-      if (parentOrigin !== "*" && event.origin !== parentOrigin) return;
-      if (parentOrigin === "*" && /^http:\/\/(127\.0\.0\.1|localhost):\d+$/.test(event.origin)) {
-        parentOrigin = event.origin;
-      }
-      executeCommand(message);
+    // Public direct API. Codex can call these methods from Android WebView.evaluateJavascript.
+    window.YouTubePlayer = Object.freeze({
+      version: PLAYER_API_VERSION,
+      command(command, value = null) {
+        return executeCommand({ command, value });
+      },
+      loadVideo(videoId, options = {}) {
+        return executeCommand({
+          command: "loadMedia",
+          value: { type: "video", videoId, ...options },
+        });
+      },
+      loadPlaylist(options = {}) {
+        return executeCommand({
+          command: "loadMedia",
+          value: { type: "playlist", ...options },
+        });
+      },
+      play() { return executeCommand({ command: "play" }); },
+      pause() { return executeCommand({ command: "pause" }); },
+      toggle() { return executeCommand({ command: "toggle" }); },
+      next() { return executeCommand({ command: "next" }); },
+      previous() { return executeCommand({ command: "previous" }); },
+      first() { return executeCommand({ command: "first" }); },
+      restart() { return executeCommand({ command: "restart" }); },
+      seekTo(seconds, allowSeekAhead = true) {
+        return executeCommand({ command: "seekTo", value: { seconds, allowSeekAhead } });
+      },
+      seekBy(seconds) { return executeCommand({ command: "seekBy", value: { seconds } }); },
+      setVolume(volume) { return executeCommand({ command: "setVolume", value: volume }); },
+      setMuted(muted) { return executeCommand({ command: "setMuted", value: !!muted }); },
+      setLoop(enabled) { return executeCommand({ command: "setLoop", value: !!enabled }); },
+      setShuffle(enabled) { return executeCommand({ command: "setShuffle", value: !!enabled }); },
+      getState() { return getPlayerSnapshot(); },
+      getProgress() { return getProgressSnapshot(); },
     });
 
-    function restorePlayerSnapshot(snapshot) {
-      if (!snapshot || !player) return;
-      const index = Math.max(0, Number(snapshot.playlistIndex) || 0);
-      const startSeconds = Math.max(0, Number(snapshot.currentTime) || 0);
-      const shouldPlay = snapshot.shouldPlay === true || snapshot.state === 1 || snapshot.state === 3;
-      setPlaybackIntent(shouldPlay, shouldPlay ? 5000 : 0);
-      if (mediaType === "playlist" && playlistId) {
-        const snapshotCanonicalPlaylist = Array.isArray(snapshot.canonicalPlaylist)
-          ? snapshot.canonicalPlaylist.filter((id) => videoIdPattern.test(String(id || "")))
-          : [];
-        if (snapshotCanonicalPlaylist.length) canonicalPlaylistIds = [...snapshotCanonicalPlaylist];
-        const playlist = canonicalPlaylistIds.length
-          ? [...canonicalPlaylistIds]
-          : Array.isArray(snapshot.playlist)
-          ? snapshot.playlist.filter((id) => videoIdPattern.test(String(id || "")))
-          : [];
-        const currentId = videoIdPattern.test(String(snapshot.currentVideoId || ""))
-          ? String(snapshot.currentVideoId)
-          : "";
-        const restoredIndex = currentId && playlist.includes(currentId)
-          ? playlist.indexOf(currentId)
-          : Number(snapshot.canonicalPlaylistIndex) >= 0
-            ? Math.min(Number(snapshot.canonicalPlaylistIndex), Math.max(0, playlist.length - 1))
-            : Math.min(index, Math.max(0, playlist.length - 1));
-        playlistPosition = restoredIndex;
-        loadPlaylistSourceAt(restoredIndex, shouldPlay, startSeconds, currentId);
-      } else {
-        const currentId = videoIdPattern.test(String(snapshot.currentVideoId || ""))
-          ? String(snapshot.currentVideoId)
-          : videoId;
-        if (currentId) {
-          const command = { videoId: currentId, startSeconds };
-          if (shouldPlay) player.loadVideoById?.(command);
-          else player.cueVideoById?.(command);
-        }
-      }
-      player.setVolume?.(Math.max(0, Math.min(100, Number(snapshot.volume) || 0)));
-      if (snapshot.muted) player.mute?.();
-      else player.unMute?.();
-      if (mediaType === "playlist") applyPlaylistModes();
-    }
+    window.addEventListener("message", (event) => {
+      const message = event.data;
+      if (!message || message.channel !== BRIDGE_CHANNEL || message.kind !== "command") return;
+      executeCommand(message);
+    });
 
     function onPlayerReady(generation, restoreSnapshot = null) {
       if (generation !== playerGeneration) return;
@@ -867,63 +663,68 @@
       const iframe = player.getIframe?.();
       if (iframe) {
         iframe.referrerPolicy = "strict-origin-when-cross-origin";
-        iframe.setAttribute("allow", "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share");
+        iframe.setAttribute(
+          "allow",
+          "accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share"
+        );
       }
       resizePlayer();
-      restorePlayerSnapshot(restoreSnapshot);
+
+      if (restoreSnapshot) {
+        restorePlayerSnapshot(restoreSnapshot);
+      } else if (mediaType === "playlist" && playlistId) {
+        loadPlaylistMedia({ playlistId, index: playlistPosition, autoplay: true });
+      } else if (mediaType === "video" && videoId) {
+        loadVideoMedia({ videoId, autoplay: true });
+      }
+
       postBridgeEvent("ready", getPlayerSnapshot());
-      while (pendingCommands.length) executeCommand(pendingCommands.shift());
-      if (!restoreSnapshot && !initialMediaCommandReceived && window.parent === window) {
-        scheduleInitialQueryMediaLoad(generation);
+      while (pendingCommands.length) {
+        const queued = pendingCommands.shift();
+        executeCommand(queued);
       }
     }
 
     function onPlayerStateChange(event, generation) {
       if (generation !== playerGeneration) return;
-      const reportedPlaylistIndex = Number(player?.getPlaylistIndex?.());
-      if (mediaType === "playlist" && Number.isFinite(reportedPlaylistIndex) && reportedPlaylistIndex >= 0) {
-        playlistPosition = reportedPlaylistIndex;
-      }
-      if (event.data === 1) {
-        playbackPausedWhileHidden = false;
-        playlistStallSince = 0;
-        markShuffleCycleVideoHandled(getCurrentVideoId());
+      const state = Number(event.data);
+      const semanticEvent = stateName(state);
+
+      if (state === YT_STATE.PLAYING) {
         setPlaybackIntent(true);
-      }
-      if (event.data === 2) {
-        if (mediaType === "playlist" && playbackIntent && isPlayerNearVideoEnd()) {
+        playlistStallSince = 0;
+        clearPlaylistEndedRecovery();
+        publishVideoChangedIfNeeded();
+        if (mediaType === "playlist") applyPlaylistModes();
+      } else if (state === YT_STATE.BUFFERING) {
+        clearPlaylistEndedRecovery();
+        publishVideoChangedIfNeeded();
+      } else if (state === YT_STATE.PAUSED) {
+        clearPlaylistEndedRecovery();
+      } else if (state === YT_STATE.CUED) {
+        publishVideoChangedIfNeeded();
+        if (mediaType === "playlist") applyPlaylistModes();
+      } else if (state === YT_STATE.ENDED) {
+        publishProgress(true);
+        if (mediaType === "video") {
+          if (loopEnabled) {
+            seekToSeconds(0, true);
+            setPlaybackIntent(true);
+            player.playVideo?.();
+          } else {
+            setPlaybackIntent(false);
+          }
+        } else if (mediaType === "playlist") {
           schedulePlaylistEndedRecovery(generation);
-        } else {
-          observePausedPlaybackIntent(generation);
         }
       }
-      if (mediaType === "playlist" && (event.data === 1 || event.data === 5)) {
-        applyPlaylistModes();
-      }
-      if (event.data === 0 && mediaType === "video" && loopEnabled) {
-        setPlaybackIntent(true, 5000);
-        player.seekTo?.(0, true);
-        player.playVideo?.();
-      }
-      if (event.data === 0 && mediaType === "playlist") {
-        schedulePlaylistEndedRecovery(generation);
-      } else if (event.data === 1 || event.data === 3) {
-        clearPlaylistEndedRecovery();
-      }
-      if (
-        activePlaylistNavigation &&
-        (event.data === 1 || event.data === 3) &&
-        playlistNavigationSucceeded(activePlaylistNavigation)
-      ) clearPlaylistNavigation();
-      publishState("state");
+
+      publishState(semanticEvent);
+      publishProgress(true);
     }
 
     function onPlayerError(event, generation) {
       if (generation !== playerGeneration) return;
-      if (mediaType === "playlist" && [100, 101, 150].includes(Number(event.data))) {
-        markShuffleCycleVideoHandled(getCurrentVideoId());
-        clearPlaylistNavigation();
-      }
       postBridgeEvent("error", {
         ...getPlayerSnapshot(),
         code: Number(event.data) || 0,
@@ -940,7 +741,7 @@
     function createYoutubePlayer(restoreSnapshot = null) {
       ensurePlayerTarget();
       const generation = ++playerGeneration;
-      const config = {
+      player = new YT.Player("player", {
         width: "100%",
         height: "100%",
         playerVars: {
@@ -955,27 +756,7 @@
           onStateChange: (event) => onPlayerStateChange(event, generation),
           onError: (event) => onPlayerError(event, generation),
         },
-      };
-      player = new YT.Player("player", config);
-    }
-
-    function recreatePlayerForPresentation(nextMode) {
-      if (nextMode === presentationMode) return;
-      clearPlaylistEndedRecovery();
-      clearPlaylistNavigation();
-      const snapshot = getPlayerSnapshot();
-      presentationMode = nextMode;
-      playerReady = false;
-      const previousPlayer = player;
-      player = null;
-      ++playerGeneration;
-      try {
-        previousPlayer?.destroy?.();
-      } catch {
-        // Le nouveau lecteur remplacera proprement toute ancienne iframe restante.
-      }
-      ensurePlayerTarget();
-      createYoutubePlayer(snapshot);
+      });
     }
 
     window.onYouTubeIframeAPIReady = function () {
@@ -983,56 +764,70 @@
     };
 
     window.addEventListener("resize", () => schedulePlayerResize());
-    document.addEventListener("visibilitychange", () => {
-      if (document.hidden) return;
-      const shouldRecover = playbackPausedWhileHidden || playbackIntent;
-      playbackPausedWhileHidden = false;
-      if (!shouldRecover || mediaType !== "playlist") return;
-      window.setTimeout(() => recoverPlaylistPlayback("visibility"), 120);
-      window.setTimeout(() => recoverPlaylistPlayback("visibility-confirm"), 1200);
-    });
     window.visualViewport?.addEventListener("resize", () => schedulePlayerResize());
+    document.addEventListener("visibilitychange", () => {
+      if (!document.hidden && playbackIntent && playerReady && player) {
+        window.setTimeout(() => {
+          const state = Number(player.getPlayerState?.());
+          if (![YT_STATE.PLAYING, YT_STATE.BUFFERING].includes(state)) player.playVideo?.();
+        }, 120);
+      }
+    });
+
     if (typeof ResizeObserver === "function") {
       const resizeObserver = new ResizeObserver(() => schedulePlayerResize());
       resizeObserver.observe(document.documentElement);
     }
 
-    if (!mediaType) {
-      playerContainer.innerHTML = '<div class="message">Aucune vidéo ou playlist valide n’a été fournie.</div>';
-      postBridgeEvent("error", { code: 2, message: "Identifiant YouTube invalide" });
-    } else {
-      const script = document.createElement("script");
-      script.src = "https://www.youtube.com/iframe_api";
-      script.referrerPolicy = "strict-origin-when-cross-origin";
-      script.onerror = () => postBridgeEvent("error", { code: 5, message: "API YouTube inaccessible" });
-      document.head.appendChild(script);
-      window.setInterval(() => {
-        if (!playerReady || !player) return;
-        const signature = `${player.getVolume?.()}-${!!player.isMuted?.()}`;
-        if (signature !== lastVolumeSignature) {
-          lastVolumeSignature = signature;
-          publishState("volume");
-        }
-        if (mediaType !== "playlist") return;
-        const state = Number(player.getPlayerState?.());
-        const current = getSafePlaylistState();
-        const heartbeatSignature = `${state}-${current.index}-${current.videoId}-${current.playlist.length}`;
-        if (heartbeatSignature !== lastPlaylistHeartbeatSignature) {
-          lastPlaylistHeartbeatSignature = heartbeatSignature;
-          publishState("snapshot");
-        }
-        if (!playbackIntent || document.hidden || [1, 3].includes(state)) {
-          playlistStallSince = 0;
-          return;
-        }
-        if (![0, -1, 5].includes(state)) return;
-        if (!playlistStallSince) playlistStallSince = Date.now();
-        if (Date.now() - playlistStallSince >= 2400) {
-          recoverPlaylistPlayback("watchdog");
-          playlistStallSince = Date.now();
-        }
-      }, 500);
-    }
+    // Smooth progress stream for a YouTube-Music-style scrubber.
+    window.setInterval(() => {
+      if (!playerReady || !player) return;
+      const state = Number(player.getPlayerState?.());
+      if ([YT_STATE.PLAYING, YT_STATE.BUFFERING].includes(state)) {
+        publishProgress();
+        publishVideoChangedIfNeeded();
+      }
+    }, PROGRESS_INTERVAL_MS);
+
+    // Low-frequency housekeeping: volume changes and playlist stall recovery.
+    window.setInterval(() => {
+      if (!playerReady || !player) return;
+
+      const volumeSignature = `${player.getVolume?.()}-${!!player.isMuted?.()}`;
+      if (volumeSignature !== lastVolumeSignature) {
+        lastVolumeSignature = volumeSignature;
+        publishState("volume");
+      }
+
+      if (mediaType !== "playlist" || !playbackIntent || document.hidden || restoringPlayer) {
+        playlistStallSince = 0;
+        return;
+      }
+
+      const state = Number(player.getPlayerState?.());
+      if ([YT_STATE.PLAYING, YT_STATE.BUFFERING, YT_STATE.PAUSED].includes(state)) {
+        playlistStallSince = 0;
+        return;
+      }
+
+      if (![YT_STATE.ENDED, YT_STATE.UNSTARTED, YT_STATE.CUED].includes(state)) return;
+      if (!playlistStallSince) playlistStallSince = Date.now();
+      if (Date.now() - playlistStallSince >= PLAYLIST_STALL_MS) {
+        advancePlaylist(1, "recovery");
+        playlistStallSince = Date.now();
+      }
+    }, 500);
+
+    // The engine is always initialized, even with no ?video= or ?playlist= query.
+    // This is important for Android: the WebView can load player.html first and choose media later.
+    const youtubeApiScript = document.createElement("script");
+    youtubeApiScript.src = "https://www.youtube.com/iframe_api";
+    youtubeApiScript.referrerPolicy = "strict-origin-when-cross-origin";
+    youtubeApiScript.onerror = () => postBridgeEvent("error", {
+      code: 5,
+      message: "API YouTube inaccessible",
+    });
+    document.head.appendChild(youtubeApiScript);
   </script>
 </body>
 </html>
