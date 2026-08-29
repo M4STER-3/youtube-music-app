@@ -50,7 +50,7 @@ jobs:
 
           output = Path(".ci-inline")
           output.mkdir(exist_ok=True)
-          for html_name in ["player.html", "test.html", "offline-tests.html"]:
+          for html_name in ["player.html", "test.html", "offline-tests.html", "test-simulated.html"]:
               parser = ScriptParser()
               parser.feed(Path(html_name).read_text(encoding="utf-8"))
               for index, source in enumerate(parser.scripts, start=1):
