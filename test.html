@@ -1,0 +1,522 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+  <meta charset="UTF-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="referrer" content="no-referrer">
+  <title>Test YouTube Music Engine</title>
+  <style>
+    :root {
+      color-scheme: dark;
+      font-family: Inter, system-ui, -apple-system, BlinkMacSystemFont, "Segoe UI", sans-serif;
+      background: #0f0f0f;
+      color: #f5f5f5;
+    }
+    * { box-sizing: border-box; }
+    body { margin: 0; padding: 20px; background: #0f0f0f; }
+    h1, h2, h3 { margin: 0 0 12px; }
+    p { color: #b8b8b8; line-height: 1.45; }
+    button, input { font: inherit; }
+    button {
+      border: 0;
+      border-radius: 10px;
+      padding: 10px 14px;
+      cursor: pointer;
+      background: #282828;
+      color: #fff;
+    }
+    button:hover { background: #343434; }
+    button:disabled { opacity: .45; cursor: default; }
+    input[type="text"], input[type="password"] {
+      width: 100%;
+      border: 1px solid #3a3a3a;
+      border-radius: 10px;
+      background: #171717;
+      color: #fff;
+      padding: 11px 12px;
+    }
+    input[type="range"] { width: 100%; }
+    .layout {
+      display: grid;
+      grid-template-columns: minmax(320px, 1.15fr) minmax(320px, .85fr);
+      gap: 18px;
+      max-width: 1400px;
+      margin: 0 auto;
+    }
+    .card {
+      background: #181818;
+      border: 1px solid #2a2a2a;
+      border-radius: 16px;
+      padding: 16px;
+      margin-bottom: 18px;
+    }
+    .player-wrap {
+      position: relative;
+      width: 100%;
+      aspect-ratio: 16 / 9;
+      background: #000;
+      border-radius: 12px;
+      overflow: hidden;
+    }
+    #playerFrame { width: 100%; height: 100%; border: 0; }
+    .row { display: flex; gap: 10px; flex-wrap: wrap; align-items: center; }
+    .row > .grow { flex: 1 1 280px; }
+    .controls { margin-top: 12px; }
+    .status {
+      display: grid;
+      grid-template-columns: repeat(4, minmax(100px, 1fr));
+      gap: 8px;
+      margin-top: 12px;
+    }
+    .metric { padding: 10px; background: #111; border-radius: 10px; }
+    .metric small { display: block; color: #888; margin-bottom: 4px; }
+    .metric strong { font-size: 14px; overflow-wrap: anywhere; }
+    .progress-line { margin-top: 12px; }
+    .progress-labels { display: flex; justify-content: space-between; color: #bbb; font-variant-numeric: tabular-nums; }
+    .notice { padding: 10px 12px; border-radius: 10px; background: #121212; color: #cfcfcf; }
+    .success { color: #9ce7b2; }
+    .error { color: #ff9d9d; }
+    .playlist-list {
+      max-height: 480px;
+      overflow: auto;
+      border: 1px solid #292929;
+      border-radius: 12px;
+    }
+    .video-row {
+      display: grid;
+      grid-template-columns: 56px 1fr auto;
+      gap: 10px;
+      align-items: center;
+      padding: 8px;
+      border-bottom: 1px solid #252525;
+      cursor: pointer;
+    }
+    .video-row:last-child { border-bottom: 0; }
+    .video-row:hover { background: #222; }
+    .video-row img { width: 56px; height: 32px; object-fit: cover; border-radius: 6px; background: #222; }
+    .video-row .title { font-size: 13px; }
+    .video-row .meta { color: #888; font-size: 11px; margin-top: 3px; }
+    .video-row .duration { color: #bbb; font-size: 12px; }
+    pre {
+      white-space: pre-wrap;
+      overflow-wrap: anywhere;
+      background: #101010;
+      padding: 12px;
+      border-radius: 10px;
+      max-height: 360px;
+      overflow: auto;
+      font-size: 12px;
+    }
+    .check-list { display: grid; gap: 8px; }
+    .check { background: #111; padding: 10px 12px; border-radius: 10px; }
+    @media (max-width: 900px) {
+      body { padding: 12px; }
+      .layout { grid-template-columns: 1fr; }
+      .status { grid-template-columns: repeat(2, 1fr); }
+    }
+  </style>
+</head>
+<body>
+  <main class="layout">
+    <section>
+      <div class="card">
+        <h1>Test du moteur YouTube</h1>
+        <p>Cette page sert uniquement au développement. Elle n’enregistre ni la clé API ni les playlists. Ouvrir via un serveur HTTP/HTTPS, pas directement avec <code>file://</code>.</p>
+        <div class="player-wrap">
+          <iframe id="playerFrame" src="player.html" allow="autoplay; encrypted-media; picture-in-picture" referrerpolicy="strict-origin-when-cross-origin"></iframe>
+        </div>
+
+        <div class="controls row">
+          <button data-command="previous">⏮ Précédent</button>
+          <button data-command="play">▶ Lecture</button>
+          <button data-command="pause">⏸ Pause</button>
+          <button data-command="next">⏭ Suivant</button>
+          <button id="back10">−10 s</button>
+          <button id="forward10">+10 s</button>
+          <button id="shuffleButton">🔀 Shuffle</button>
+          <button id="loopButton">🔁 Loop</button>
+        </div>
+
+        <div class="progress-line">
+          <input id="seek" type="range" min="0" max="0" step="0.1" value="0" disabled>
+          <div class="progress-labels"><span id="currentTime">0:00</span><span id="duration">0:00</span></div>
+        </div>
+
+        <div class="status">
+          <div class="metric"><small>État</small><strong id="stateName">—</strong></div>
+          <div class="metric"><small>Vidéo</small><strong id="videoId">—</strong></div>
+          <div class="metric"><small>Progression</small><strong id="progressPercent">0 %</strong></div>
+          <div class="metric"><small>Buffer</small><strong id="bufferPercent">0 %</strong></div>
+        </div>
+
+        <h3 style="margin-top:16px">Vidéo unique</h3>
+        <div class="row">
+          <div class="grow"><input id="singleVideo" type="text" placeholder="ID vidéo YouTube (11 caractères)"></div>
+          <button id="loadSingleVideo">Charger</button>
+        </div>
+      </div>
+
+      <div class="card">
+        <h2>Playlist YouTube Data API</h2>
+        <p>La clé saisie ici reste uniquement dans la mémoire JavaScript de cette page. Elle n’est ni stockée ni commitée.</p>
+        <div class="row">
+          <div class="grow"><input id="apiKey" type="password" autocomplete="off" placeholder="Clé YouTube Data API"></div>
+        </div>
+        <div class="row" style="margin-top:10px">
+          <div class="grow"><input id="playlistInput" type="text" placeholder="URL ou ID de playlist YouTube"></div>
+          <button id="importPlaylist">Importer</button>
+          <button id="updatePlaylist" disabled>Update</button>
+          <button id="loadPlaylistInPlayer" disabled>Lire la playlist</button>
+        </div>
+        <div id="importStatus" class="notice" style="margin-top:10px">Aucune importation en cours.</div>
+        <div id="playlistSummary" style="margin-top:12px"></div>
+        <div id="playlistList" class="playlist-list" style="margin-top:12px; display:none"></div>
+      </div>
+    </section>
+
+    <aside>
+      <div class="card">
+        <h2>Auto-tests</h2>
+        <div id="selfTests" class="check-list"></div>
+        <div class="row" style="margin-top:12px">
+          <button id="runBridgeTest">Tester le bridge Android</button>
+        </div>
+        <div id="bridgeStatus" class="notice" style="margin-top:10px">Bridge Android non testé.</div>
+      </div>
+
+      <div class="card">
+        <h2>Dernier état</h2>
+        <pre id="snapshot">{}</pre>
+      </div>
+
+      <div class="card">
+        <h2>Journal d’événements</h2>
+        <div class="row"><button id="clearLog">Effacer</button></div>
+        <pre id="log"></pre>
+      </div>
+    </aside>
+  </main>
+
+  <script src="youtube-api.js"></script>
+  <script>
+    "use strict";
+
+    const BRIDGE_CHANNEL = "focus-hub-youtube";
+    const ANDROID_HANDSHAKE = "youtube-player-bridge";
+    const frame = document.getElementById("playerFrame");
+    const seek = document.getElementById("seek");
+    const currentTimeLabel = document.getElementById("currentTime");
+    const durationLabel = document.getElementById("duration");
+    const stateNameLabel = document.getElementById("stateName");
+    const videoIdLabel = document.getElementById("videoId");
+    const progressPercentLabel = document.getElementById("progressPercent");
+    const bufferPercentLabel = document.getElementById("bufferPercent");
+    const snapshot = document.getElementById("snapshot");
+    const log = document.getElementById("log");
+    const importStatus = document.getElementById("importStatus");
+    const playlistSummary = document.getElementById("playlistSummary");
+    const playlistList = document.getElementById("playlistList");
+    const bridgeStatus = document.getElementById("bridgeStatus");
+
+    let currentPlaylist = null;
+    let latestPlayerState = null;
+    let draggingSeek = false;
+    let shuffleEnabled = false;
+    let loopEnabled = false;
+    let androidPort = null;
+    let androidRequestId = 0;
+    const pendingAndroidRequests = new Map();
+    const logEntries = [];
+
+    function formatTime(totalSeconds) {
+      const seconds = Math.max(0, Math.floor(Number(totalSeconds) || 0));
+      const hours = Math.floor(seconds / 3600);
+      const minutes = Math.floor((seconds % 3600) / 60);
+      const remainder = seconds % 60;
+      return hours > 0
+        ? `${hours}:${String(minutes).padStart(2, "0")}:${String(remainder).padStart(2, "0")}`
+        : `${minutes}:${String(remainder).padStart(2, "0")}`;
+    }
+
+    function appendLog(label, payload) {
+      logEntries.unshift(`[${new Date().toLocaleTimeString()}] ${label}\n${JSON.stringify(payload, null, 2)}`);
+      if (logEntries.length > 60) logEntries.length = 60;
+      log.textContent = logEntries.join("\n\n");
+    }
+
+    function sendCommand(command, value = null) {
+      if (!frame.contentWindow) return;
+      frame.contentWindow.postMessage({
+        channel: BRIDGE_CHANNEL,
+        kind: "command",
+        command,
+        value,
+      }, "*");
+    }
+
+    function renderPlayerState(data) {
+      if (!data || typeof data !== "object") return;
+      latestPlayerState = { ...(latestPlayerState || {}), ...data };
+      snapshot.textContent = JSON.stringify(latestPlayerState, null, 2);
+      stateNameLabel.textContent = data.stateName || latestPlayerState.stateName || "—";
+      videoIdLabel.textContent = data.currentVideoId || latestPlayerState.currentVideoId || "—";
+
+      const duration = Math.max(0, Number(data.duration ?? latestPlayerState.duration) || 0);
+      const currentTime = Math.max(0, Number(data.currentTime ?? latestPlayerState.currentTime) || 0);
+      const loadedFraction = Math.max(0, Math.min(1, Number(data.loadedFraction ?? latestPlayerState.loadedFraction) || 0));
+      const progress = duration > 0 ? Math.max(0, Math.min(1, currentTime / duration)) : 0;
+
+      durationLabel.textContent = formatTime(duration);
+      if (!draggingSeek) {
+        seek.max = String(duration || 0);
+        seek.value = String(Math.min(currentTime, duration || currentTime));
+        seek.disabled = duration <= 0;
+        currentTimeLabel.textContent = formatTime(currentTime);
+      }
+      progressPercentLabel.textContent = `${(progress * 100).toFixed(1)} %`;
+      bufferPercentLabel.textContent = `${(loadedFraction * 100).toFixed(1)} %`;
+    }
+
+    window.addEventListener("message", (event) => {
+      if (event.source !== frame.contentWindow) return;
+      const message = event.data;
+      if (!message || message.channel !== BRIDGE_CHANNEL || message.kind !== "event") return;
+      renderPlayerState(message.data);
+      if (message.event !== "progress") appendLog(`player:${message.event}`, message.data);
+    });
+
+    document.querySelectorAll("[data-command]").forEach((button) => {
+      button.addEventListener("click", () => sendCommand(button.dataset.command));
+    });
+    document.getElementById("back10").addEventListener("click", () => sendCommand("seekBy", { seconds: -10 }));
+    document.getElementById("forward10").addEventListener("click", () => sendCommand("seekBy", { seconds: 10 }));
+    document.getElementById("shuffleButton").addEventListener("click", () => {
+      shuffleEnabled = !shuffleEnabled;
+      sendCommand("setShuffle", shuffleEnabled);
+      document.getElementById("shuffleButton").textContent = shuffleEnabled ? "🔀 Shuffle ON" : "🔀 Shuffle";
+    });
+    document.getElementById("loopButton").addEventListener("click", () => {
+      loopEnabled = !loopEnabled;
+      sendCommand("setLoop", loopEnabled);
+      document.getElementById("loopButton").textContent = loopEnabled ? "🔁 Loop ON" : "🔁 Loop";
+    });
+
+    seek.addEventListener("pointerdown", () => { draggingSeek = true; });
+    seek.addEventListener("input", () => {
+      draggingSeek = true;
+      currentTimeLabel.textContent = formatTime(seek.value);
+    });
+    seek.addEventListener("change", () => {
+      sendCommand("seekTo", { seconds: Number(seek.value), allowSeekAhead: true });
+      draggingSeek = false;
+    });
+    seek.addEventListener("pointerup", () => { draggingSeek = false; });
+
+    document.getElementById("loadSingleVideo").addEventListener("click", () => {
+      const videoId = document.getElementById("singleVideo").value.trim();
+      sendCommand("loadMedia", { type: "video", videoId, autoplay: true });
+    });
+
+    function progressText(info) {
+      const loaded = Number(info.loaded) || 0;
+      const total = Number(info.total) || 0;
+      if (info.stage === "playlistItems") return `Playlist : ${loaded}${total ? ` / ${total}` : ""} — ${info.requests} requêtes`;
+      if (info.stage === "videoDetails") return `Durées/détails : ${loaded} / ${total} — ${info.requests} requêtes`;
+      if (info.stage === "metadata") return `Métadonnées récupérées — ${info.requests} requête`;
+      if (info.stage === "done") return `Terminé : ${loaded} vidéos — ${info.requests} requêtes`;
+      return `Étape : ${info.stage}`;
+    }
+
+    function renderPlaylist(result, diff = null) {
+      currentPlaylist = result;
+      document.getElementById("updatePlaylist").disabled = false;
+      document.getElementById("loadPlaylistInPlayer").disabled = !result.playableVideoIds?.length;
+      playlistSummary.innerHTML = `
+        <div class="notice">
+          <strong>${escapeHtml(result.title || result.playlistId)}</strong><br>
+          ${result.stats?.total ?? result.items.length} entrées • ${result.stats?.playable ?? 0} lisibles • ${result.stats?.unavailable ?? 0} indisponibles • ${result.requestsUsed ?? 0} requêtes
+          ${diff ? `<br>Update : +${diff.counts.added} / -${diff.counts.removed} / ${diff.counts.moved} déplacées / ${diff.counts.changed} modifiées` : ""}
+        </div>`;
+
+      playlistList.style.display = "block";
+      playlistList.textContent = "";
+      const fragment = document.createDocumentFragment();
+      result.items.forEach((item) => {
+        const row = document.createElement("div");
+        row.className = "video-row";
+        row.title = item.playable ? "Cliquer pour lire" : "Vidéo non lisible";
+        if (!item.playable) row.style.opacity = ".5";
+        const img = document.createElement("img");
+        if (item.thumbnail?.url) img.src = item.thumbnail.url;
+        img.alt = "";
+        const text = document.createElement("div");
+        const title = document.createElement("div");
+        title.className = "title";
+        title.textContent = `${item.position + 1}. ${item.title || "Sans titre"}`;
+        const meta = document.createElement("div");
+        meta.className = "meta";
+        meta.textContent = `${item.channelTitle || "Chaîne inconnue"} • ${item.videoId || "ID indisponible"}`;
+        text.append(title, meta);
+        const duration = document.createElement("div");
+        duration.className = "duration";
+        duration.textContent = item.durationText || "—";
+        row.append(img, text, duration);
+        if (item.playable && item.videoId) {
+          row.addEventListener("click", () => sendCommand("loadMedia", { type: "video", videoId: item.videoId, autoplay: true }));
+        }
+        fragment.appendChild(row);
+      });
+      playlistList.appendChild(fragment);
+    }
+
+    function escapeHtml(value) {
+      return String(value || "").replace(/[&<>"']/g, (character) => ({
+        "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;",
+      })[character]);
+    }
+
+    async function importOrUpdate(update) {
+      const apiKey = document.getElementById("apiKey").value.trim();
+      const playlistValue = document.getElementById("playlistInput").value.trim();
+      importStatus.className = "notice";
+      importStatus.textContent = update ? "Mise à jour…" : "Importation…";
+      try {
+        const options = {
+          apiKey,
+          includeVideoDetails: true,
+          onProgress(info) { importStatus.textContent = progressText(info); },
+        };
+        const result = update
+          ? await YouTubeData.syncPlaylist(playlistValue, currentPlaylist, options)
+          : await YouTubeData.getPlaylist(playlistValue, options);
+        importStatus.className = "notice success";
+        importStatus.textContent = `✅ ${result.items.length} entrées récupérées en ${result.requestsUsed} requêtes.`;
+        renderPlaylist(result, result.diff || null);
+        appendLog(update ? "playlist:update" : "playlist:import", {
+          playlistId: result.playlistId,
+          stats: result.stats,
+          requestsUsed: result.requestsUsed,
+          diff: result.diff?.counts || null,
+        });
+      } catch (error) {
+        importStatus.className = "notice error";
+        importStatus.textContent = `❌ ${error?.message || error}`;
+        appendLog("playlist:error", { code: error?.code, reason: error?.reason, message: error?.message });
+      }
+    }
+
+    document.getElementById("importPlaylist").addEventListener("click", () => importOrUpdate(false));
+    document.getElementById("updatePlaylist").addEventListener("click", () => importOrUpdate(true));
+    document.getElementById("loadPlaylistInPlayer").addEventListener("click", () => {
+      if (!currentPlaylist?.playableVideoIds?.length) return;
+      sendCommand("loadMedia", {
+        type: "playlist",
+        playlistId: currentPlaylist.playlistId,
+        playlistIds: currentPlaylist.playableVideoIds,
+        index: 0,
+        autoplay: true,
+        shuffle: shuffleEnabled,
+        loop: loopEnabled,
+      });
+    });
+
+    document.getElementById("clearLog").addEventListener("click", () => {
+      logEntries.length = 0;
+      log.textContent = "";
+    });
+
+    function runSelfTests() {
+      const tests = [
+        ["Durée PT3M5S → 185 s", () => YouTubeData.parseIso8601Duration("PT3M5S") === 185],
+        ["Format 185 s → 3:05", () => YouTubeData.formatDuration(185) === "3:05"],
+        ["Extraction URL playlist", () => YouTubeData.extractPlaylistId("https://www.youtube.com/playlist?list=PL1234567890ABCDE") === "PL1234567890ABCDE"],
+        ["ID playlist direct", () => YouTubeData.extractPlaylistId("PL1234567890ABCDE") === "PL1234567890ABCDE"],
+        ["API player chargée dans iframe", () => !!frame.contentWindow],
+      ];
+      const root = document.getElementById("selfTests");
+      root.textContent = "";
+      for (const [name, test] of tests) {
+        let passed = false;
+        try { passed = !!test(); } catch {}
+        const item = document.createElement("div");
+        item.className = `check ${passed ? "success" : "error"}`;
+        item.textContent = `${passed ? "✅" : "❌"} ${name}`;
+        root.appendChild(item);
+      }
+    }
+
+    function ensureAndroidBridgeScript() {
+      return new Promise((resolve, reject) => {
+        try {
+          const doc = frame.contentDocument;
+          if (!doc) throw new Error("iframe inaccessible : utiliser un serveur même origine");
+          if (frame.contentWindow.AndroidPlayerBridge) return resolve();
+          const script = doc.createElement("script");
+          script.src = new URL("android-bridge.js", location.href).href;
+          script.onload = () => resolve();
+          script.onerror = () => reject(new Error("android-bridge.js impossible à charger"));
+          doc.head.appendChild(script);
+        } catch (error) { reject(error); }
+      });
+    }
+
+    function sendAndroidRequest(request) {
+      if (!androidPort) return Promise.reject(new Error("Port Android non connecté"));
+      const id = ++androidRequestId;
+      return new Promise((resolve, reject) => {
+        const timer = setTimeout(() => {
+          pendingAndroidRequests.delete(id);
+          reject(new Error("Timeout bridge Android"));
+        }, 3000);
+        pendingAndroidRequests.set(id, { resolve, reject, timer });
+        androidPort.postMessage(JSON.stringify({ id, ...request }));
+      });
+    }
+
+    async function runBridgeTest() {
+      bridgeStatus.className = "notice";
+      bridgeStatus.textContent = "Test du WebMessagePort…";
+      try {
+        await ensureAndroidBridgeScript();
+        if (androidPort) {
+          try { androidPort.close(); } catch {}
+          androidPort = null;
+        }
+        const channel = new MessageChannel();
+        androidPort = channel.port1;
+        androidPort.onmessage = (event) => {
+          let message = null;
+          try { message = JSON.parse(event.data); } catch { return; }
+          appendLog(`android:${message.kind || "message"}`, message);
+          if (message.kind === "response" && message.id != null) {
+            const pending = pendingAndroidRequests.get(message.id);
+            if (!pending) return;
+            clearTimeout(pending.timer);
+            pendingAndroidRequests.delete(message.id);
+            if (message.ok) pending.resolve(message.result);
+            else pending.reject(new Error(message.error?.message || "Erreur bridge"));
+          }
+        };
+        androidPort.start?.();
+        frame.contentWindow.postMessage(ANDROID_HANDSHAKE, "*", [channel.port2]);
+        await new Promise((resolve) => setTimeout(resolve, 120));
+        const ready = await sendAndroidRequest({ action: "isReady" });
+        const progress = await sendAndroidRequest({ action: "getProgress" });
+        bridgeStatus.className = "notice success";
+        bridgeStatus.textContent = `✅ Bridge connecté. Player ready=${!!ready?.ready}. Progression reçue=${typeof progress?.currentTime === "number"}.`;
+      } catch (error) {
+        bridgeStatus.className = "notice error";
+        bridgeStatus.textContent = `❌ ${error?.message || error}`;
+      }
+    }
+
+    document.getElementById("runBridgeTest").addEventListener("click", runBridgeTest);
+
+    frame.addEventListener("load", () => {
+      runSelfTests();
+      setTimeout(() => sendCommand("getState"), 500);
+    });
+    runSelfTests();
+  </script>
+</body>
+</html>
