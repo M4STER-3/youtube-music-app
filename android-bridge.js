@@ -1,7 +1,7 @@
 (function (global) {
   "use strict";
 
-  const BRIDGE_VERSION = "1.1.0";
+  const BRIDGE_VERSION = "1.1.1";
   const HANDSHAKE = "youtube-player-bridge";
   const EVENT_NAME = "youtube-player-event";
   let port = null;
@@ -284,8 +284,11 @@
   }
 
   global.addEventListener("message", (event) => {
-    if (event.source !== global) return;
-    if (event.origin !== global.location.origin) return;
+    // postWebMessage() from Android may not expose a normal web sender origin/source.
+    // targetOrigin is enforced on the native side. If a browser frame is the sender,
+    // reject it unless it is the main same-origin window.
+    if (event.source && event.source !== global) return;
+    if (event.origin && event.origin !== global.location.origin) return;
     if (event?.data !== HANDSHAKE) return;
     const nextPort = event?.ports?.[0];
     if (nextPort) attachPort(nextPort);
