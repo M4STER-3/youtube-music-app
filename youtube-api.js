@@ -1,9 +1,15 @@
 (function (global) {
   "use strict";
 
-  const API_VERSION = "1.0.0";
+  const API_VERSION = "1.1.0";
   const API_ROOT = "https://www.googleapis.com/youtube/v3";
   const MAX_RESULTS = 50;
+  const DEFAULT_MAX_RETRIES = 2;
+  const DEFAULT_RETRY_BASE_DELAY_MS = 500;
+  const DEFAULT_RETRY_MAX_DELAY_MS = 5000;
+  const REFRESH_RECOMMENDED_DAYS = 25;
+  const MUST_REFRESH_DAYS = 30;
+  const DAY_MS = 24 * 60 * 60 * 1000;
   const PLAYLIST_ID_PATTERN = /^[A-Za-z0-9_-]{6,120}$/;
   const VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
 
@@ -17,6 +23,7 @@
       this.reason = String(details.reason || "");
       this.code = String(details.code || this.reason || "youtubeApiError");
       this.retryable = !!details.retryable;
+      this.retryAfterMs = Math.max(0, Number(details.retryAfterMs) || 0);
       this.details = details.details || null;
     }
   }
@@ -118,7 +125,17 @@
     }
   }
 
-  function apiErrorFromResponse(status, body) {
+  function parseRetryAfter(value) {
+    const raw = String(value || "").trim();
+    if (!raw) return 0;
+    const seconds = Number(raw);
+    if (Number.isFinite(seconds) && seconds >= 0) return Math.round(seconds * 1000);
+    const date = Date.parse(raw);
+    if (!Number.isFinite(date)) return 0;
+    return Math.max(0, date - Date.now());
+  }
+
+  function apiErrorFromResponse(status, body, response = null) {
     const first = body?.error?.errors?.[0] || {};
     const reason = String(first.reason || body?.error?.status || "");
     const message = String(body?.error?.message || first.message || `Erreur YouTube API (${status})`);
@@ -133,11 +150,67 @@
       reason,
       code: reason || `http${status}`,
       retryable,
+      retryAfterMs: parseRetryAfter(response?.headers?.get?.("Retry-After")),
       details: body?.error || null,
     });
   }
 
-  async function apiFetch(resource, params, options = {}) {
+  function abortError() {
+    try {
+      return new DOMException("Opération annulée", "AbortError");
+    } catch {
+      const error = new Error("Opération annulée");
+      error.name = "AbortError";
+      return error;
+    }
+  }
+
+  function throwIfAborted(signal) {
+    if (signal?.aborted) throw abortError();
+  }
+
+  function sleep(delayMs, signal) {
+    const delay = Math.max(0, Number(delayMs) || 0);
+    if (!delay) {
+      throwIfAborted(signal);
+      return Promise.resolve();
+    }
+    return new Promise((resolve, reject) => {
+      throwIfAborted(signal);
+      let settled = false;
+      const timer = global.setTimeout(() => {
+        if (settled) return;
+        settled = true;
+        signal?.removeEventListener?.("abort", onAbort);
+        resolve();
+      }, delay);
+      function onAbort() {
+        if (settled) return;
+        settled = true;
+        global.clearTimeout(timer);
+        signal?.removeEventListener?.("abort", onAbort);
+        reject(abortError());
+      }
+      signal?.addEventListener?.("abort", onAbort, { once: true });
+    });
+  }
+
+  function retryPolicy(options = {}) {
+    return {
+      maxRetries: Math.max(0, Math.min(5, Math.floor(Number(options.maxRetries ?? DEFAULT_MAX_RETRIES) || 0))),
+      baseDelayMs: Math.max(100, Math.min(5000, Number(options.retryBaseDelayMs) || DEFAULT_RETRY_BASE_DELAY_MS)),
+      maxDelayMs: Math.max(500, Math.min(30000, Number(options.retryMaxDelayMs) || DEFAULT_RETRY_MAX_DELAY_MS)),
+    };
+  }
+
+  function computeRetryDelay(retryIndex, error, policy) {
+    const exponential = policy.baseDelayMs * (2 ** Math.max(0, retryIndex));
+    const jitter = Math.random() * Math.min(250, policy.baseDelayMs);
+    const serverDelay = Math.max(0, Number(error?.retryAfterMs) || 0);
+    return Math.round(Math.min(policy.maxDelayMs, Math.max(exponential + jitter, serverDelay)));
+  }
+
+  async function apiFetch(resource, params, options = {}, counters = null) {
     const apiKey = requireApiKey(options.apiKey);
     const url = new URL(`${API_ROOT}/${resource}`);
     for (const [key, value] of Object.entries(params || {})) {
@@ -146,32 +219,62 @@
     }
     url.searchParams.set("key", apiKey);
 
-    let response;
-    try {
-      response = await fetch(url.toString(), {
-        method: "GET",
-        signal: options.signal,
-        cache: "no-store",
-        referrerPolicy: "no-referrer",
-      });
-    } catch (error) {
-      if (error?.name === "AbortError") throw error;
-      throw new YouTubeApiError("Impossible de contacter l’API YouTube", {
-        code: "networkError",
-        reason: "networkError",
-        retryable: true,
-        details: String(error?.message || error || ""),
-      });
-    }
+    const policy = retryPolicy(options);
+    let retryIndex = 0;
 
-    let body = null;
-    try {
-      body = await response.json();
-    } catch {
-      body = null;
+    while (true) {
+      throwIfAborted(options.signal);
+      if (counters) counters.requests += 1;
+
+      let response = null;
+      let requestError = null;
+      try {
+        response = await fetch(url.toString(), {
+          method: "GET",
+          signal: options.signal,
+          cache: "no-store",
+          referrerPolicy: "no-referrer",
+        });
+
+        let body = null;
+        try {
+          body = await response.json();
+        } catch {
+          body = null;
+        }
+
+        if (response.ok) return body || {};
+        requestError = apiErrorFromResponse(response.status, body, response);
+      } catch (error) {
+        if (error?.name === "AbortError") throw error;
+        requestError = error instanceof YouTubeApiError
+          ? error
+          : new YouTubeApiError("Impossible de contacter l’API YouTube", {
+              code: "networkError",
+              reason: "networkError",
+              retryable: true,
+              details: String(error?.message || error || ""),
+            });
+      }
+
+      if (!requestError?.retryable || retryIndex >= policy.maxRetries) throw requestError;
+
+      const delayMs = computeRetryDelay(retryIndex, requestError, policy);
+      retryIndex += 1;
+      if (counters) counters.retries += 1;
+      emitProgress(options.onProgress, {
+        stage: "retry",
+        resource,
+        retry: retryIndex,
+        maxRetries: policy.maxRetries,
+        delayMs,
+        status: Number(requestError.status) || 0,
+        reason: String(requestError.reason || requestError.code || ""),
+        requests: counters?.requests || 0,
+        retries: counters?.retries || 0,
+      });
+      await sleep(delayMs, options.signal);
     }
-    if (!response.ok) throw apiErrorFromResponse(response.status, body);
-    return body || {};
   }
 
   async function fetchPlaylistMetadata(playlistId, options, counters) {
@@ -179,8 +282,7 @@
       part: "snippet,contentDetails,status",
       id: playlistId,
       maxResults: 1,
-    }, options);
-    counters.requests += 1;
+    }, options, counters);
 
     const playlist = response?.items?.[0];
     if (!playlist) {
@@ -217,8 +319,7 @@
         playlistId,
         maxResults: MAX_RESULTS,
         pageToken: nextPageToken,
-      }, options);
-      counters.requests += 1;
+      }, options, counters);
       page += 1;
       reportedTotal = Math.max(reportedTotal, Number(response?.pageInfo?.totalResults) || 0);
 
@@ -250,6 +351,7 @@
         loaded: items.length,
         total: reportedTotal || null,
         requests: counters.requests,
+        retries: counters.retries,
       });
     } while (nextPageToken);
 
@@ -268,9 +370,7 @@
       const response = await apiFetch("videos", {
         part: "snippet,contentDetails,status",
         id: ids.join(","),
-        maxResults: MAX_RESULTS,
-      }, options);
-      counters.requests += 1;
+      }, options, counters);
 
       for (const video of response?.items || []) {
         const currentVideoId = String(video.id || "");
@@ -311,6 +411,7 @@
         loaded: Math.min(completed, uniqueVideoIds.length),
         total: uniqueVideoIds.length,
         requests: counters.requests,
+        retries: counters.retries,
       });
     }
 
@@ -405,6 +506,24 @@
     };
   }
 
+  function refreshDates(timestamp = Date.now()) {
+    const base = Number(timestamp) || Date.now();
+    return {
+      refreshRecommendedAt: new Date(base + REFRESH_RECOMMENDED_DAYS * DAY_MS).toISOString(),
+      mustRefreshBy: new Date(base + MUST_REFRESH_DAYS * DAY_MS).toISOString(),
+    };
+  }
+
+  function isRefreshDue(syncedAt, now = Date.now(), afterDays = REFRESH_RECOMMENDED_DAYS) {
+    const synced = Date.parse(String(syncedAt || ""));
+    if (!Number.isFinite(synced)) return true;
+    return Number(now) - synced >= Math.max(1, Number(afterDays) || REFRESH_RECOMMENDED_DAYS) * DAY_MS;
+  }
+
+  function isExpired(syncedAt, now = Date.now()) {
+    return isRefreshDue(syncedAt, now, MUST_REFRESH_DAYS);
+  }
+
   async function getPlaylist(value, options = {}) {
     const playlistId = extractPlaylistId(value);
     if (!playlistId) {
@@ -415,7 +534,7 @@
     }
 
     requireApiKey(options.apiKey);
-    const counters = { requests: 0 };
+    const counters = { requests: 0, retries: 0 };
     const startedAt = Date.now();
 
     emitProgress(options.onProgress, {
@@ -424,6 +543,7 @@
       loaded: 0,
       total: null,
       requests: 0,
+      retries: 0,
     });
 
     const metadata = await fetchPlaylistMetadata(playlistId, options, counters);
@@ -433,6 +553,7 @@
       loaded: 0,
       total: metadata.reportedItemCount || null,
       requests: counters.requests,
+      retries: counters.retries,
     });
 
     const pageResult = await fetchAllPlaylistItems(playlistId, options, counters);
@@ -445,6 +566,7 @@
       : mergePlaylistItems(pageResult.items, details);
 
     const finishedAt = Date.now();
+    const syncDates = refreshDates(finishedAt);
     const result = {
       apiVersion: API_VERSION,
       ...metadata,
@@ -455,8 +577,10 @@
       stats: summarizeItems(items),
       reportedItemCount: Math.max(metadata.reportedItemCount, pageResult.reportedTotal),
       syncedAt: new Date(finishedAt).toISOString(),
+      ...syncDates,
       elapsedMs: finishedAt - startedAt,
       requestsUsed: counters.requests,
+      retriesUsed: counters.retries,
     };
 
     emitProgress(options.onProgress, {
@@ -465,6 +589,7 @@
       loaded: items.length,
       total: items.length,
       requests: counters.requests,
+      retries: counters.retries,
       elapsedMs: result.elapsedMs,
     });
 
@@ -495,6 +620,9 @@
     extractPlaylistId,
     parseIso8601Duration,
     formatDuration,
+    buildDiff,
+    isRefreshDue,
+    isExpired,
     getPlaylist,
     syncPlaylist,
   });
