@@ -1,680 +1,262 @@
-# YouTube Music App — moteur
+# YouTube Music App — moteur Android
 
-Ce dépôt contient le moteur YouTube destiné à une future application Android native en Java.
+Ce dépôt contient le moteur YouTube préparé pour une application Android native en Java.
 
-Le dépôt fournit la partie lecture, synchronisation YouTube et communication WebView. L'interface Android finale, le stockage SQLite et l'APK seront construits séparément autour de ce moteur.
+Le moteur est désormais séparé de l'interface Android finale : Codex doit construire l'UI, le stockage local et l'APK **autour** des composants fournis, sans réécrire le lecteur.
 
-## Objectifs
+## À lire en premier pour l'intégration Android
 
-Le moteur permet de :
+➡️ **`CODEX_HANDOFF.md`**
 
-- lire une vidéo ou une playlist YouTube ;
-- gérer play/pause, précédent/suivant, shuffle et loop ;
-- récupérer le temps courant, la durée et le buffer ;
-- déplacer la lecture avec une barre de progression ;
-- importer des playlists de plus de 50 vidéos ;
-- récupérer titres, chaînes, miniatures et durées ;
-- synchroniser une playlist avec un bouton Update ;
-- transmettre ces données à Android sans dépendance externe ;
-- utiliser une WebView avec une origine HTTPS stable et un canal `WebMessagePort`.
+Ce fichier contient le contrat complet : architecture, WebView, bridge, SQLite, clé API, tests, contraintes YouTube et définition de terminé.
 
-## Règles d'architecture
-
-Application cible :
-
-- Android natif ;
-- Java 17 ;
-- `minSdk 26` ;
-- aucune dépendance Android externe nécessaire pour ce moteur ;
-- pas de Capacitor ;
-- pas de Tauri ;
-- pas de Flutter ;
-- pas de React Native ;
-- pas de Jetpack Compose requis ;
-- pas d'ExoPlayer/Media3 requis pour YouTube ;
-- lecture YouTube via l'IFrame Player API dans une WebView.
-
-**Ne pas réécrire `player.html` dans l'application Android.** L'interface native doit utiliser les APIs documentées ici.
-
-`index.html` est l'ancien moteur d'origine conservé comme référence. La nouvelle application doit utiliser `player.html`.
-
----
-
-# Fichiers
-
-## `player.html`
-
-Moteur de lecture principal.
-
-API JavaScript :
-
-```js
-window.YouTubePlayer
-```
-
-Version actuelle du contrat lecteur :
+## Architecture cible
 
 ```text
-1.1.x
+Android Java natif
+│
+├── UI native
+├── SQLiteOpenHelper / SharedPreferences
+│
+└── WebView
+    └── https://app.local/player.html
+        ├── player.html
+        ├── youtube-api.js
+        └── android-bridge.js
 ```
 
-Le lecteur peut démarrer sans média, puis recevoir une vidéo ou une playlist plus tard.
+Aucun backend n'est requis.
 
-Il n'accepte le protocole `window.postMessage` historique que depuis un parent **same-origin** de confiance. Android n'utilise pas ce protocole : Android utilise le `WebMessagePort` décrit plus bas.
+Aucun framework multiplateforme n'est requis.
 
-## `youtube-api.js`
+## Versions du contrat moteur
 
-Client YouTube Data API sans dépendance externe.
-
-API publique :
-
-```js
-window.YouTubeData
+```text
+YouTubePlayer : 1.2.0
+YouTubeData   : 1.1.0
+AndroidBridge : 1.3.0
 ```
+
+## Fichiers principaux
+
+### `player.html`
+
+Lecteur YouTube IFrame API.
+
+Fonctions principales :
+
+```text
+play / pause
+next / previous
+shuffle / loop
+seekTo / seekBy
+volume / mute
+currentTime / duration
+progress / loadedFraction
+playlistEnded
+autoplayBlocked
+normalisation des erreurs YouTube
+```
+
+Le lecteur garde les doublons de playlist et gère la fin d'un cycle `shuffle=true` + `loop=false` sans réappliquer le shuffle à chaque changement d'état.
+
+### `youtube-api.js`
+
+Client YouTube Data API sans bibliothèque externe.
 
 Il gère :
 
-- extraction de l'ID de playlist ;
-- pagination `playlistItems.list` par groupes de 50 ;
-- récupération des détails vidéo par groupes de 50 ;
-- conservation de l'ordre et des doublons ;
-- durées ISO 8601 -> secondes ;
-- miniatures ;
-- vidéos indisponibles ;
-- vidéos non intégrables ;
-- progression d'import ;
-- synchronisation et diff d'Update.
+- playlists de plus de 50 vidéos ;
+- pagination automatique ;
+- titres, chaînes, miniatures et durées ;
+- ordre et doublons ;
+- vidéos indisponibles/non intégrables ;
+- Update avec diff ;
+- retry exponentiel avec jitter sur erreurs temporaires ;
+- aucun retry automatique sur erreurs définitives de quota/clé ;
+- dates de rafraîchissement recommandées et obligatoires.
 
-## `android-bridge.js`
-
-Adaptateur JavaScript entre Android et :
+Résultat d'import :
 
 ```text
-YouTubePlayer
-YouTubeData
+syncedAt
+refreshRecommendedAt   // J+25
+mustRefreshBy          // J+30
+requestsUsed
+retriesUsed
 ```
 
-Le bridge sait donc commander le lecteur **et** importer/synchroniser des playlists.
+### `android-bridge.js`
 
-Le bridge est injecté depuis les assets de l'APK après le chargement de la page de confiance.
+Bridge bidirectionnel Android ↔ JavaScript via `WebMessagePort`.
 
-## `android-reference/YouTubeWebMessageBridge.java`
+Il transporte :
 
-Classe Java de référence utilisant uniquement :
+- commandes lecteur ;
+- événements lecteur ;
+- import/synchronisation YouTube Data API ;
+- progression de l'import ;
+- erreurs structurées.
 
-- `WebView` ;
-- `WebMessage` ;
-- `WebMessagePort` ;
-- `org.json`.
+Le handshake Android est lié à l'origine `https://app.local` et protégé par un nonce aléatoire par chargement.
+
+### `android-reference/AndroidYouTubePlayerHost.java`
+
+Configuration WebView de référence, sans dépendance externe.
 
 Elle :
 
-- injecte `youtube-api.js` ;
-- injecte `android-bridge.js` ;
-- crée le `WebMessagePort` ;
-- envoie les commandes du lecteur ;
-- envoie les commandes YouTube Data API ;
-- reçoit les événements, progressions et réponses.
+- charge `player.html` depuis les assets ;
+- donne à la page l'origine logique `https://app.local` ;
+- bloque les navigations top-level non approuvées ;
+- active les réglages nécessaires au lecteur ;
+- installe le bridge après chargement de la page de confiance.
 
-## `android-reference/AndroidYouTubePlayerHost.java`
+### `android-reference/YouTubeWebMessageBridge.java`
 
-Bootstrap WebView de référence.
-
-Il configure une WebView native sans package supplémentaire et charge `player.html` depuis les assets avec :
+API Java de référence pour :
 
 ```text
-https://app.local/player.html
+play/pause/seek
+loadVideo/loadPlaylist
+getState/getProgress
+setYouTubeApiKey
+getPlaylist
+syncPlaylist
 ```
 
-Cette URL est une identité locale logique : aucun serveur `app.local` n'est contacté pour charger `player.html`.
+### `test.html`
 
-Le HTML est fourni directement à `loadDataWithBaseURL()`.
+Test manuel réel du lecteur et de l'API YouTube.
 
-Le host :
+À ouvrir via HTTP/HTTPS local, jamais directement avec `file://`.
 
-- active JavaScript car le moteur en a besoin ;
-- active DOM storage ;
-- enlève la seconde barrière de geste WebView pour la lecture ;
-- interdit l'accès aux fichiers locaux ;
-- interdit les URL `content://` ;
-- interdit le contenu mixte HTTP dans la page HTTPS ;
-- active Safe Browsing ;
-- bloque toute navigation **top-level** hors de `https://app.local` ;
-- laisse les sous-frames YouTube fonctionner ;
-- installe le bridge uniquement après le chargement de la page de confiance.
+### `offline-tests.html`
 
-## `test.html`
+Test navigateur **sans réseau et sans quota**.
 
-Interface de développement uniquement.
+Il simule notamment une playlist de 420 entrées, un doublon, une vidéo indisponible, un retry 500 et une erreur `quotaExceeded`.
 
-Elle teste :
+### `tests/youtube-api.test.cjs`
 
-- vidéo unique ;
-- play/pause ;
-- précédent/suivant ;
-- shuffle/loop ;
-- progression ;
-- durée ;
-- seek ;
-- buffer ;
-- import d'une playlist complète ;
-- affichage des métadonnées ;
-- Update/diff ;
-- simulation du bridge Android avec `MessageChannel`.
+Même scénario sous Node, sans dépendance de test.
 
-La clé API saisie dans `test.html` reste en mémoire et n'est pas enregistrée.
+Commande locale :
 
----
-
-# API du lecteur
-
-## Charger une vidéo
-
-```js
-YouTubePlayer.loadVideo("VIDEO_ID", {
-  autoplay: true,
-  startSeconds: 0,
-});
+```bash
+node tests/youtube-api.test.cjs
 ```
 
-## Charger une playlist connue par l'application
+### `.github/workflows/validate.yml`
 
-```js
-YouTubePlayer.loadPlaylist({
-  playlistId: "PLAYLIST_ID",
-  playlistIds: ["VIDEO_ID_1", "VIDEO_ID_2"],
-  index: 0,
-  autoplay: true,
-  shuffle: false,
-  loop: false,
-  startSeconds: 0,
-});
-```
+Validation GitHub prévue pour :
 
-Les doublons dans `playlistIds` sont autorisés et conservés.
+- syntaxe de `youtube-api.js` ;
+- syntaxe de `android-bridge.js` ;
+- syntaxe des scripts inline HTML ;
+- scénario de régression YouTube Data API.
 
-## Contrôles
+Si GitHub Actions n'est pas activé sur le dépôt, le même test Node peut être lancé localement.
 
-```js
-YouTubePlayer.play();
-YouTubePlayer.pause();
-YouTubePlayer.toggle();
-YouTubePlayer.next();
-YouTubePlayer.previous();
-YouTubePlayer.first();
-YouTubePlayer.restart();
-
-YouTubePlayer.seekTo(125);
-YouTubePlayer.seekBy(10);
-YouTubePlayer.seekBy(-10);
-
-YouTubePlayer.setVolume(70);
-YouTubePlayer.setMuted(false);
-YouTubePlayer.setShuffle(true);
-YouTubePlayer.setLoop(true);
-```
-
-## État et progression
-
-```js
-const state = YouTubePlayer.getState();
-const progress = YouTubePlayer.getProgress();
-const currentTime = YouTubePlayer.getCurrentTime();
-const duration = YouTubePlayer.getDuration();
-```
-
-Exemple :
-
-```json
-{
-  "state": 1,
-  "stateName": "playing",
-  "currentVideoId": "xxxxxxxxxxx",
-  "currentTime": 97.4,
-  "duration": 252,
-  "progress": 0.3865,
-  "loadedFraction": 0.82
-}
-```
-
-L'interface Android peut afficher :
+## Contraintes Android prévues
 
 ```text
-1:37  ━━━━━━━●━━━━━━━━━━  4:12
+Android natif
+Java 17
+minSdk 26
+pas de Capacitor
+pas de Tauri
+pas de Flutter
+pas de React Native
+pas de Compose requis
+pas d'ExoPlayer/Media3 pour YouTube
 ```
 
----
+Les classes de référence Java n'ont volontairement pas de déclaration `package`; Codex doit les placer dans le package réel de l'application.
 
-# Événements du lecteur
-
-Canal logique :
-
-```text
-focus-hub-youtube
-```
-
-Événements principaux :
-
-```text
-ready
-playing
-paused
-pauseConfirmed
-buffering
-cued
-ended
-videoChanged
-progress
-seeked
-volume
-playlistEnded
-snapshot
-error
-```
-
-`progress` est émis régulièrement pendant la lecture afin que l'interface native puisse animer la barre sans interroger YouTube en boucle.
-
----
-
-# Sécurité de l'origine
-
-`player.html` calcule son origine de confiance à partir de :
-
-```js
-window.location.origin
-```
-
-Les origines `file:`, `data:` et les origines `null` ne sont pas considérées comme de confiance.
-
-Android doit charger la page avec l'origine :
-
-```text
-https://app.local
-```
-
-Cette origine est aussi fournie au lecteur YouTube via le paramètre IFrame API :
-
-```text
-origin=https://app.local
-```
-
-Le protocole historique `window.postMessage` n'accepte que :
-
-- le `window.parent` direct ;
-- la même origine que `player.html`.
-
-Il n'y a plus de `postMessage(..., "*")` dans le nouveau lecteur.
-
----
-
-# YouTube Data API
-
-## Premier import en JavaScript
-
-```js
-const playlist = await YouTubeData.getPlaylist(playlistUrlOrId, {
-  apiKey,
-  includeVideoDetails: true,
-  onProgress(info) {
-    console.log(info);
-  },
-});
-```
-
-Le résultat contient notamment :
-
-```text
-playlistId
-title
-channelTitle
-thumbnail
-reportedItemCount
-items
-videoIds
-playableVideoIds
-stats
-syncedAt
-requestsUsed
-```
-
-Chaque entrée peut contenir :
-
-```text
-playlistItemId
-position
-videoId
-title
-channelId
-channelTitle
-thumbnail
-durationIso
-durationSeconds
-durationText
-available
-embeddable
-playable
-privacyStatus
-uploadStatus
-```
-
-## Update en JavaScript
-
-```js
-const updated = await YouTubeData.syncPlaylist(
-  playlistUrlOrId,
-  ancienneCopie,
-  { apiKey, onProgress }
-);
-```
-
-Diff :
-
-```text
-added
-removed
-moved
-changed
-```
-
----
-
-# Clé YouTube API
-
-**Ne jamais commiter une vraie clé API dans ce dépôt.**
-
-En JavaScript :
-
-```js
-YouTubeData.setApiKey(apiKey);
-```
-
-Dans Android :
-
-```java
-bridge.setYouTubeApiKey(apiKey);
-```
-
-La clé est alors conservée seulement dans la mémoire JavaScript du WebView. `android-bridge.js` ne la renvoie jamais dans ses réponses.
-
-L'application finale devra définir sa propre méthode de configuration de la clé et les restrictions Google Cloud appropriées.
-
----
-
-# Bridge Android
-
-Architecture :
-
-```text
-Android Java
-     │
-     │ WebMessagePort
-     ▼
-android-bridge.js
-     ├─────────────► YouTubePlayer
-     │
-     └─────────────► YouTubeData
-```
-
-Handshake :
-
-```text
-youtube-player-bridge
-```
-
-Le `targetOrigin` Java doit être exactement :
-
-```text
-https://app.local
-```
-
-Il ne faut pas utiliser `*` dans l'intégration finale.
-
-## Commandes lecteur côté Java
-
-Exemples :
-
-```java
-bridge.sendCommand("play");
-bridge.sendCommand("pause");
-bridge.seekTo(135);
-bridge.getProgress();
-bridge.getState();
-bridge.loadVideo(videoId, true, 0);
-bridge.loadPlaylist(playlistId, ids, 0, true, false, false, 0);
-```
-
-## Commandes Data API côté Java
-
-Configurer la clé :
-
-```java
-bridge.setYouTubeApiKey(apiKey);
-```
-
-Importer :
-
-```java
-long requestId = bridge.getPlaylist(playlistUrlOrId);
-```
-
-Mettre à jour :
-
-```java
-long requestId = bridge.syncPlaylist(playlistUrlOrId, previousPlaylistJson);
-```
-
-Pendant l'import, Android reçoit :
-
-```json
-{
-  "bridge": "youtube-player-bridge",
-  "kind": "bridgeEvent",
-  "event": "youtubeDataProgress",
-  "requestId": 42,
-  "data": {
-    "stage": "playlistItems",
-    "loaded": 150,
-    "total": 437
-  }
-}
-```
-
-À la fin, Android reçoit une réponse compacte : les descriptions longues ne sont volontairement pas renvoyées par le bridge afin d'éviter des messages inutilement volumineux.
-
-## Réponse générique
-
-```json
-{
-  "bridge": "youtube-player-bridge",
-  "kind": "response",
-  "id": 12,
-  "ok": true,
-  "result": {}
-}
-```
-
-## Événement lecteur vers Android
-
-```json
-{
-  "bridge": "youtube-player-bridge",
-  "kind": "playerEvent",
-  "payload": {
-    "channel": "focus-hub-youtube",
-    "kind": "event",
-    "event": "progress",
-    "data": {
-      "currentTime": 42.5,
-      "duration": 240
-    }
-  }
-}
-```
-
----
-
-# Intégration Android recommandée
-
-Assets à copier dans :
-
-```text
-app/src/main/assets/
-```
-
-Fichiers :
-
-```text
-player.html
-youtube-api.js
-android-bridge.js
-```
-
-Classes Java de référence :
-
-```text
-AndroidYouTubePlayerHost.java
-YouTubeWebMessageBridge.java
-```
-
-Permission manifeste obligatoire :
+Permission manifeste :
 
 ```xml
 <uses-permission android:name="android.permission.INTERNET" />
 ```
 
-Création :
+## Données locales
 
-```java
-AndroidYouTubePlayerHost host = new AndroidYouTubePlayerHost(
-    webView,
-    new AndroidYouTubePlayerHost.Listener() {
-        @Override
-        public void onBridgeMessage(String json) {
-            // parser les événements/réponses
-        }
-    }
-);
+Recommandation sans package externe :
 
-host.load();
+```text
+SharedPreferences
+→ volume, mute, shuffle, loop, dernière lecture
+
+SQLiteOpenHelper
+→ playlists, entrées, favoris, historique
 ```
 
-Puis, après réception du message `bridgeReady` :
+Toujours identifier une entrée de playlist avec `playlistItemId`, pas uniquement `videoId`, afin de préserver les doublons.
+
+## Règle de rafraîchissement YouTube
+
+Les métadonnées issues de l'API YouTube ne doivent pas rester stockées indéfiniment sans actualisation.
+
+Le moteur calcule :
+
+```text
+refreshRecommendedAt = synchronisation + 25 jours
+mustRefreshBy        = synchronisation + 30 jours
+```
+
+L'app doit conserver le bouton manuel `Update` et tenter une synchronisation avant la limite de 30 jours.
+
+Les données créées uniquement par l'app — favoris, réglages, ordre personnel — peuvent rester locales indépendamment du refresh YouTube.
+
+## Sécurité clé API
+
+Ne jamais commiter une vraie clé dans ce dépôt.
+
+La clé peut être injectée à l'exécution :
 
 ```java
-YouTubeWebMessageBridge bridge = host.getBridge();
 bridge.setYouTubeApiKey(apiKey);
 ```
 
-À la destruction de l'écran :
+Sans backend, une clé incluse dans l'APK reste techniquement extractible. Limiter au minimum la clé à **YouTube Data API v3** dans Google Cloud et surveiller son quota.
 
-```java
-host.close();
-```
+## Contraintes YouTube de lecture
 
----
+- Ne pas télécharger/cacher la vidéo ou l'audio YouTube.
+- Ne pas extraire uniquement l'audio.
+- Garder la lecture dans l'IFrame Player API.
+- Prévoir un player visible avec un viewport conforme aux exigences YouTube, notamment au moins 200 × 200 px.
 
-# Données locales Android
-
-Sans package externe :
-
-- réglages simples : `SharedPreferences` ;
-- playlists, vidéos, favoris, historique : SQLite avec `SQLiteOpenHelper`.
-
-Données playlist utiles :
-
-```text
-playlistId
-title
-thumbnail
-syncedAt
-```
-
-Données par entrée :
-
-```text
-playlistItemId
-playlistId
-position
-videoId
-title
-channelTitle
-thumbnail URL
-durationSeconds
-available
-embeddable
-playable
-```
-
-État de lecture utile :
-
-```text
-currentVideoId
-playlistId
-playlistIndex
-currentTime
-volume
-muted
-shuffle
-loop
-```
-
----
-
-# Test manuel navigateur
-
-`player.html` n'accepte plus une origine `file://` pour le protocole parent. Il faut donc servir les fichiers avec un serveur HTTP/HTTPS local.
-
-Ouvrir :
-
-```text
-test.html
-```
+## Tests avant passage à Codex
 
 Ordre conseillé :
 
-1. vérifier `ready` ;
-2. charger une vidéo ;
-3. tester play/pause ;
-4. tester seek et ±10 s ;
-5. vérifier `duration` / `currentTime` ;
-6. saisir temporairement une clé API ;
-7. importer une playlist > 50 vidéos ;
-8. vérifier miniatures et durées ;
-9. lancer la playlist ;
-10. tester shuffle/loop/précédent/suivant ;
-11. lancer Update ;
-12. tester le bridge simulé.
+```text
+1. node tests/youtube-api.test.cjs
+2. offline-tests.html
+3. test.html avec une vraie vidéo
+4. test.html avec une vraie playlist > 50 vidéos
+5. test shuffle/loop/seek
+6. test bridge simulé
+```
 
----
+Puis Codex peut commencer la partie Android en suivant **`CODEX_HANDOFF.md`**.
 
-# Points de restauration Git
+## Jalons Git
 
 ```text
 backup-original-import
 milestone-player-api-v1
 milestone-playlist-android-bridge-v1
 milestone-test-readme-v1
+milestone-secure-android-integration-v1
 ```
 
-- `backup-original-import` : copie initiale ;
-- `milestone-player-api-v1` : durée, progression, seek ;
-- `milestone-playlist-android-bridge-v1` : grandes playlists + premier pont Android ;
-- `milestone-test-readme-v1` : page de test + premier contrat complet.
+Le jalon final destiné au handoff sera :
 
-Un nouveau jalon doit être créé après validation des améliorations de sécurité Android.
+```text
+milestone-codex-ready-v1
+```
 
----
-
-# Ce que Codex devra faire plus tard
-
-Codex devra principalement :
-
-1. créer l'application Android Java native ;
-2. copier les trois assets web ;
-3. reprendre les deux classes Java de référence ;
-4. construire l'interface type lecteur musical ;
-5. créer le stockage SQLite local ;
-6. relier boutons, barre, playlists et bibliothèque aux APIs documentées ;
-7. produire et tester l'APK.
-
-Codex ne devrait pas remplacer le moteur YouTube, recréer la pagination YouTube Data API ou changer le bridge sans raison précise.
+`test-youtube` n'est pas modifié par ce dépôt : l'ancien projet reste indépendant.
