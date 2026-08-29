@@ -202,7 +202,7 @@
     "use strict";
 
     const BRIDGE_CHANNEL = "focus-hub-youtube";
-    const ANDROID_HANDSHAKE = "youtube-player-bridge";
+    const TRUSTED_ORIGIN = location.origin;
     const frame = document.getElementById("playerFrame");
     const seek = document.getElementById("seek");
     const currentTimeLabel = document.getElementById("currentTime");
@@ -251,7 +251,7 @@
         kind: "command",
         command,
         value,
-      }, "*");
+      }, TRUSTED_ORIGIN);
     }
 
     function renderPlayerState(data) {
@@ -279,6 +279,7 @@
 
     window.addEventListener("message", (event) => {
       if (event.source !== frame.contentWindow) return;
+      if (event.origin !== TRUSTED_ORIGIN) return;
       const message = event.data;
       if (!message || message.channel !== BRIDGE_CHANNEL || message.kind !== "event") return;
       renderPlayerState(message.data);
@@ -432,6 +433,7 @@
         ["Extraction URL playlist", () => YouTubeData.extractPlaylistId("https://www.youtube.com/playlist?list=PL1234567890ABCDE") === "PL1234567890ABCDE"],
         ["ID playlist direct", () => YouTubeData.extractPlaylistId("PL1234567890ABCDE") === "PL1234567890ABCDE"],
         ["API player chargée dans iframe", () => !!frame.contentWindow],
+        ["Origine HTTP(S) de confiance", () => /^https?:\/\//i.test(TRUSTED_ORIGIN)],
       ];
       const root = document.getElementById("selfTests");
       root.textContent = "";
@@ -445,19 +447,26 @@
       }
     }
 
-    function ensureAndroidBridgeScript() {
+    function loadFrameScript(filename, globalName) {
       return new Promise((resolve, reject) => {
         try {
           const doc = frame.contentDocument;
           if (!doc) throw new Error("iframe inaccessible : utiliser un serveur même origine");
-          if (frame.contentWindow.AndroidPlayerBridge) return resolve();
+          if (globalName && frame.contentWindow[globalName]) return resolve();
           const script = doc.createElement("script");
-          script.src = new URL("android-bridge.js", location.href).href;
+          script.src = new URL(filename, location.href).href;
           script.onload = () => resolve();
-          script.onerror = () => reject(new Error("android-bridge.js impossible à charger"));
+          script.onerror = () => reject(new Error(`${filename} impossible à charger`));
           doc.head.appendChild(script);
-        } catch (error) { reject(error); }
+        } catch (error) {
+          reject(error);
+        }
       });
+    }
+
+    async function ensureAndroidBridgeScript() {
+      await loadFrameScript("youtube-api.js", "YouTubeData");
+      await loadFrameScript("android-bridge.js", "AndroidPlayerBridge");
     }
 
     function sendAndroidRequest(request) {
@@ -482,6 +491,7 @@
           try { androidPort.close(); } catch {}
           androidPort = null;
         }
+
         const channel = new MessageChannel();
         androidPort = channel.port1;
         androidPort.onmessage = (event) => {
@@ -498,12 +508,19 @@
           }
         };
         androidPort.start?.();
-        frame.contentWindow.postMessage(ANDROID_HANDSHAKE, "*", [channel.port2]);
-        await new Promise((resolve) => setTimeout(resolve, 120));
+
+        // In the browser test we are same-origin, so attach the transferred port directly.
+        // Android production uses postWebMessage(..., https://app.local) instead.
+        const attached = frame.contentWindow.AndroidPlayerBridge.attachPort(channel.port2);
+        if (!attached) throw new Error("Impossible d’attacher le MessagePort");
+
+        await new Promise((resolve) => setTimeout(resolve, 80));
         const ready = await sendAndroidRequest({ action: "isReady" });
         const progress = await sendAndroidRequest({ action: "getProgress" });
+        const keyState = await sendAndroidRequest({ action: "hasYouTubeApiKey" });
+
         bridgeStatus.className = "notice success";
-        bridgeStatus.textContent = `✅ Bridge connecté. Player ready=${!!ready?.ready}. Progression reçue=${typeof progress?.currentTime === "number"}.`;
+        bridgeStatus.textContent = `✅ Bridge connecté. Player ready=${!!ready?.ready}. Progression=${typeof progress?.currentTime === "number"}. YouTubeData=${typeof keyState?.configured === "boolean"}.`;
       } catch (error) {
         bridgeStatus.className = "notice error";
         bridgeStatus.textContent = `❌ ${error?.message || error}`;
