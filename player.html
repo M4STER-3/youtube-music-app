@@ -46,12 +46,12 @@
   <script>
     "use strict";
 
-    // Stable bridge contract used by the browser host today and by the Android WebView later.
     const BRIDGE_CHANNEL = "focus-hub-youtube";
     const PLAYER_API_VERSION = "1.0.0";
     const PROGRESS_INTERVAL_MS = 250;
     const PLAYLIST_RECOVERY_DELAY_MS = 900;
     const PLAYLIST_STALL_MS = 2600;
+    const PAUSE_CONFIRM_DELAY_MS = 1200;
 
     const VIDEO_ID_PATTERN = /^[A-Za-z0-9_-]{11}$/;
     const PLAYLIST_ID_PATTERN = /^[A-Za-z0-9_-]{6,120}$/;
@@ -99,6 +99,7 @@
     let lastPublishedVideoId = "";
     let playlistEndedTimer = 0;
     let playlistStallSince = 0;
+    let pauseIntentTimer = 0;
     let restoringPlayer = false;
     const pendingCommands = [];
 
@@ -114,9 +115,9 @@
 
     function normalizeVideoIds(ids) {
       if (!Array.isArray(ids)) return [];
-      return [...new Set(ids
+      return ids
         .map((id) => String(id || ""))
-        .filter((id) => VIDEO_ID_PATTERN.test(id)))]
+        .filter((id) => VIDEO_ID_PATTERN.test(id))
         .slice(0, 5000);
     }
 
@@ -244,11 +245,7 @@
 
     function postBridgeEvent(event, data = {}) {
       const payload = buildBridgePayload(event, data);
-
-      // Direct same-page API for tests and WebView evaluateJavascript consumers.
       window.dispatchEvent(new CustomEvent("youtube-player-event", { detail: payload }));
-
-      // Existing iframe/browser integration remains supported.
       if (window.parent !== window) {
         window.parent.postMessage(payload, "*");
       }
@@ -283,8 +280,32 @@
       publishState("videoChanged");
     }
 
+    function clearPauseIntentTimer() {
+      window.clearTimeout(pauseIntentTimer);
+      pauseIntentTimer = 0;
+    }
+
     function setPlaybackIntent(shouldPlay) {
+      clearPauseIntentTimer();
       playbackIntent = !!shouldPlay;
+    }
+
+    function observePausedPlaybackIntent() {
+      clearPauseIntentTimer();
+      if (!playbackIntent || !playerReady || !player) return;
+      const generation = playerGeneration;
+      pauseIntentTimer = window.setTimeout(() => {
+        pauseIntentTimer = 0;
+        if (
+          generation === playerGeneration &&
+          playerReady &&
+          player &&
+          Number(player.getPlayerState?.()) === YT_STATE.PAUSED
+        ) {
+          playbackIntent = false;
+          publishState("pauseConfirmed");
+        }
+      }, PAUSE_CONFIRM_DELAY_MS);
     }
 
     function clearPlaylistEndedRecovery() {
@@ -397,12 +418,10 @@
       const runtime = getRuntimePlaylist();
       const currentIndex = getPlaylistIndex();
       if (runtime.length && !loopEnabled && !shuffleEnabled) {
-        if (direction > 0 && currentIndex >= runtime.length - 1) {
-          if (reason === "ended") {
-            setPlaybackIntent(false);
-            publishState("playlistEnded");
-            return false;
-          }
+        if (direction > 0 && currentIndex >= runtime.length - 1 && reason === "ended") {
+          setPlaybackIntent(false);
+          publishState("playlistEnded");
+          return false;
         }
         if (direction < 0 && currentIndex <= 0) {
           player.playVideoAt?.(0);
@@ -503,6 +522,7 @@
       const snapshot = getPlayerSnapshot();
       presentationMode = cleanMode;
       clearPlaylistEndedRecovery();
+      clearPauseIntentTimer();
       playerReady = false;
       const previous = player;
       player = null;
@@ -523,7 +543,7 @@
       if (!playerReady || !player) {
         if (["getState", "getProgress"].includes(command)) return false;
         pendingCommands.push({ command, value });
-        return false;
+        return true;
       }
 
       switch (command) {
@@ -614,9 +634,9 @@
       return true;
     }
 
-    // Public direct API. Codex can call these methods from Android WebView.evaluateJavascript.
     window.YouTubePlayer = Object.freeze({
       version: PLAYER_API_VERSION,
+      isReady() { return playerReady && !!player; },
       command(command, value = null) {
         return executeCommand({ command, value });
       },
@@ -649,6 +669,8 @@
       setShuffle(enabled) { return executeCommand({ command: "setShuffle", value: !!enabled }); },
       getState() { return getPlayerSnapshot(); },
       getProgress() { return getProgressSnapshot(); },
+      getCurrentTime() { return getProgressSnapshot().currentTime; },
+      getDuration() { return getProgressSnapshot().duration; },
     });
 
     window.addEventListener("message", (event) => {
@@ -697,14 +719,17 @@
         publishVideoChangedIfNeeded();
         if (mediaType === "playlist") applyPlaylistModes();
       } else if (state === YT_STATE.BUFFERING) {
+        clearPauseIntentTimer();
         clearPlaylistEndedRecovery();
         publishVideoChangedIfNeeded();
       } else if (state === YT_STATE.PAUSED) {
         clearPlaylistEndedRecovery();
+        observePausedPlaybackIntent();
       } else if (state === YT_STATE.CUED) {
         publishVideoChangedIfNeeded();
         if (mediaType === "playlist") applyPlaylistModes();
       } else if (state === YT_STATE.ENDED) {
+        clearPauseIntentTimer();
         publishProgress(true);
         if (mediaType === "video") {
           if (loopEnabled) {
@@ -779,7 +804,6 @@
       resizeObserver.observe(document.documentElement);
     }
 
-    // Smooth progress stream for a YouTube-Music-style scrubber.
     window.setInterval(() => {
       if (!playerReady || !player) return;
       const state = Number(player.getPlayerState?.());
@@ -789,7 +813,6 @@
       }
     }, PROGRESS_INTERVAL_MS);
 
-    // Low-frequency housekeeping: volume changes and playlist stall recovery.
     window.setInterval(() => {
       if (!playerReady || !player) return;
 
@@ -818,8 +841,6 @@
       }
     }, 500);
 
-    // The engine is always initialized, even with no ?video= or ?playlist= query.
-    // This is important for Android: the WebView can load player.html first and choose media later.
     const youtubeApiScript = document.createElement("script");
     youtubeApiScript.src = "https://www.youtube.com/iframe_api";
     youtubeApiScript.referrerPolicy = "strict-origin-when-cross-origin";
