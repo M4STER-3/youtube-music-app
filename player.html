@@ -47,7 +47,7 @@
     "use strict";
 
     const BRIDGE_CHANNEL = "focus-hub-youtube";
-    const PLAYER_API_VERSION = "1.0.0";
+    const PLAYER_API_VERSION = "1.1.0";
     const PROGRESS_INTERVAL_MS = 250;
     const PLAYLIST_RECOVERY_DELAY_MS = 900;
     const PLAYLIST_STALL_MS = 2600;
@@ -72,6 +72,19 @@
       [3]: "buffering",
       [5]: "cued",
     });
+
+    function resolveTrustedOrigin() {
+      try {
+        const origin = String(window.location.origin || "");
+        return /^https?:\/\/[^/]+$/i.test(origin) ? origin : "";
+      } catch {
+        return "";
+      }
+    }
+
+    // Android loads this document with loadDataWithBaseURL("https://app.local/player.html", ...).
+    // Browser test.html is same-origin. Null/file/data origins are deliberately not trusted.
+    const TRUSTED_ORIGIN = resolveTrustedOrigin();
 
     const params = new URLSearchParams(window.location.search);
     const initialRawPlaylistId = params.get("playlist") || "";
@@ -246,8 +259,11 @@
     function postBridgeEvent(event, data = {}) {
       const payload = buildBridgePayload(event, data);
       window.dispatchEvent(new CustomEvent("youtube-player-event", { detail: payload }));
-      if (window.parent !== window) {
-        window.parent.postMessage(payload, "*");
+
+      // Browser embedding is supported only for a same-origin trusted parent.
+      // Android does not use this path; it uses WebMessagePort through android-bridge.js.
+      if (window.parent !== window && TRUSTED_ORIGIN) {
+        window.parent.postMessage(payload, TRUSTED_ORIGIN);
       }
     }
 
@@ -674,6 +690,10 @@
     });
 
     window.addEventListener("message", (event) => {
+      if (window.parent === window) return;
+      if (!TRUSTED_ORIGIN) return;
+      if (event.source !== window.parent) return;
+      if (event.origin !== TRUSTED_ORIGIN) return;
       const message = event.data;
       if (!message || message.channel !== BRIDGE_CHANNEL || message.kind !== "command") return;
       executeCommand(message);
@@ -766,16 +786,19 @@
     function createYoutubePlayer(restoreSnapshot = null) {
       ensurePlayerTarget();
       const generation = ++playerGeneration;
+      const playerVars = {
+        playsinline: 1,
+        rel: 0,
+        controls: presentationMode === "background" ? 0 : 1,
+        disablekb: presentationMode === "background" ? 1 : 0,
+        enablejsapi: 1,
+      };
+      if (TRUSTED_ORIGIN) playerVars.origin = TRUSTED_ORIGIN;
+
       player = new YT.Player("player", {
         width: "100%",
         height: "100%",
-        playerVars: {
-          playsinline: 1,
-          rel: 0,
-          controls: presentationMode === "background" ? 0 : 1,
-          disablekb: presentationMode === "background" ? 1 : 0,
-          enablejsapi: 1,
-        },
+        playerVars,
         events: {
           onReady: () => onPlayerReady(generation, restoreSnapshot),
           onStateChange: (event) => onPlayerStateChange(event, generation),
