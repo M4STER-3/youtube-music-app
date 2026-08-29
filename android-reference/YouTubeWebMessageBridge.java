@@ -12,6 +12,7 @@ import java.io.BufferedReader;
 import java.io.IOException;
 import java.io.InputStreamReader;
 import java.nio.charset.StandardCharsets;
+import java.util.UUID;
 import java.util.concurrent.atomic.AtomicLong;
 
 /**
@@ -23,6 +24,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * android-bridge.js and youtube-api.js are loaded from APK assets and injected into
  * the trusted main frame. No JavaScript interface is exposed to the YouTube iframe.
+ *
+ * The initial native handshake is authenticated with a fresh random nonce per page load.
  */
 public final class YouTubeWebMessageBridge implements AutoCloseable {
     public static final String HANDSHAKE = "youtube-player-bridge";
@@ -40,6 +43,7 @@ public final class YouTubeWebMessageBridge implements AutoCloseable {
 
     private WebMessagePort androidPort;
     private boolean installed;
+    private String bridgeNonce = "";
 
     public YouTubeWebMessageBridge(
             WebView webView,
@@ -69,6 +73,7 @@ public final class YouTubeWebMessageBridge implements AutoCloseable {
         webView.post(() -> {
             closePortOnly();
             installed = false;
+            bridgeNonce = UUID.randomUUID().toString();
 
             final String dataApiScript;
             final String bridgeScript;
@@ -77,16 +82,26 @@ public final class YouTubeWebMessageBridge implements AutoCloseable {
                 bridgeScript = readAsset("android-bridge.js");
             } catch (IOException error) {
                 notifyListener(errorJson("bridgeAssetError", error.getMessage()));
+                bridgeNonce = "";
                 return;
             }
 
-            // Both assets are code shipped inside the APK. They run only in the trusted main page.
-            String installationScript = dataApiScript + "\n;\n" + bridgeScript;
+            // UUID contains only characters that are safe inside the quoted JS literal.
+            String installationScript =
+                    "window.__ANDROID_BRIDGE_NONCE=\"" + bridgeNonce + "\";\n" +
+                    dataApiScript + "\n;\n" +
+                    bridgeScript;
+
             webView.evaluateJavascript(installationScript, ignored -> createMessageChannel());
         });
     }
 
     private void createMessageChannel() {
+        if (bridgeNonce.isEmpty()) {
+            notifyListener(errorJson("missingBridgeNonce", "Nonce du pont Android absent"));
+            return;
+        }
+
         WebMessagePort[] ports = webView.createWebMessageChannel();
         if (ports == null || ports.length != 2) {
             notifyListener(errorJson("messageChannelError", "Canal WebMessage indisponible"));
@@ -102,8 +117,18 @@ public final class YouTubeWebMessageBridge implements AutoCloseable {
             }
         });
 
+        JSONObject handshakePayload = new JSONObject();
+        try {
+            handshakePayload.put("bridge", HANDSHAKE);
+            handshakePayload.put("nonce", bridgeNonce);
+        } catch (JSONException ignored) {
+        }
+
         // ports[1] is transferred to JavaScript and must never be reused by Java afterwards.
-        WebMessage handshake = new WebMessage(HANDSHAKE, new WebMessagePort[]{ports[1]});
+        WebMessage handshake = new WebMessage(
+                handshakePayload.toString(),
+                new WebMessagePort[]{ports[1]}
+        );
         webView.postWebMessage(handshake, targetOrigin);
         installed = true;
     }
@@ -317,6 +342,7 @@ public final class YouTubeWebMessageBridge implements AutoCloseable {
 
     private void closePortOnly() {
         installed = false;
+        bridgeNonce = "";
         WebMessagePort currentPort = androidPort;
         androidPort = null;
         if (currentPort != null) {
