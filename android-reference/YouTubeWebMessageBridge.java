@@ -19,7 +19,8 @@ import java.util.concurrent.atomic.AtomicLong;
  *
  * Uses only Android framework APIs (WebMessagePort, API 23+) and org.json.
  * Call installAfterPageFinished() after the trusted local player page has finished loading.
- * The app should prevent this WebView from navigating to untrusted top-level pages.
+ * Pass an explicit target origin. Use WILDCARD_ORIGIN only when unavoidable, and then
+ * prevent this WebView from navigating to untrusted top-level pages.
  */
 public final class YouTubeWebMessageBridge implements AutoCloseable {
     public static final String HANDSHAKE = "youtube-player-bridge";
@@ -47,7 +48,8 @@ public final class YouTubeWebMessageBridge implements AutoCloseable {
         if (webView == null) throw new IllegalArgumentException("webView == null");
         this.webView = webView;
         this.appContext = webView.getContext().getApplicationContext();
-        this.targetOrigin = targetOrigin != null ? targetOrigin : WILDCARD_ORIGIN;
+        if (targetOrigin == null) throw new IllegalArgumentException("targetOrigin == null");
+        this.targetOrigin = targetOrigin;
         this.listener = listener;
     }
 
