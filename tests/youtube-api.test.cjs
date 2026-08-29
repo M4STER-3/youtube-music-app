@@ -213,7 +213,11 @@ async function main() {
       { playlistItemId: "C", position: 1, title: "C", channelTitle: "C", durationSeconds: 10, available: true, embeddable: true },
     ] }
   );
-  assert.deepEqual(diff.counts, { added: 1, removed: 1, moved: 1, changed: 1 });
+  // diff.counts comes from a vm.Context, so compare primitive fields rather than object prototypes.
+  assert.equal(diff.counts.added, 1);
+  assert.equal(diff.counts.removed, 1);
+  assert.equal(diff.counts.moved, 1);
+  assert.equal(diff.counts.changed, 1);
 
   const quotaFetch = createQuotaFetch();
   sandbox.fetch = quotaFetch;
